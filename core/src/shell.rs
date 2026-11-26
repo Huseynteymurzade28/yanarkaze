@@ -4,9 +4,10 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_time::{Instant, Timer};
 use embedded_io_async::{Read, Write};
-use heapless::{String, Vec};
+use heapless::String;
 use portable_atomic::Ordering;
 
+use crate::editor::{Editor, Out};
 use crate::platform::System;
 use crate::state::{
     ALERT_MILLI_C, BUTTON_PRESSES, EVENTS, Event, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS, alert_limit_c,
@@ -16,8 +17,6 @@ use crate::term::Term;
 use crate::{VERSION, fun};
 
 const PROMPT: &str = "\x1b[1;38;5;208myanarkaze\x1b[0m\x1b[1;38;5;51m>\x1b[0m ";
-const LINE_MAX: usize = 96;
-const HISTORY: usize = 8;
 
 const LOGO: &[&str] = &[
     "  \x1b[1;38;5;196m      \x1b[1;38;5;202m      \x1b[1;38;5;208m      \x1b[1;38;5;214m      \x1b[1;38;5;220m     \x1b[1;38;5;159m _   \x1b[1;38;5;123m      \x1b[1;38;5;87m     \x1b[1;38;5;51m     \x1b[0m",
@@ -31,33 +30,86 @@ const LOGO: &[&str] = &[
     "",
 ];
 
-const HELP: &[&str] = &[
-    "System:",
-    "  help                 show this help",
-    "  info                 board, chip, clock, uptime and reset reason",
-    "  ps                   list running tasks and their wakeups",
-    "  led <mode>           on | off | blink [ms] | heartbeat | morse <text>",
-    "  temp                 on-chip temperature (and supply voltage)",
-    "  watch                live temperature graph (press any key to stop)",
-    "  alert <celsius>      set the temperature alert threshold",
-    "  uptime               time since boot",
-    "  hang                 freeze the executor -> watchdog resets the system",
-    "  reboot               restart",
-    "  clear                clear the screen",
-    "",
-    "Fun:",
-    "  reaction             reflex game: hit the button when the LED turns on",
-    "  roll [N]dM           roll dice with the RNG (roll 2d6, roll d20)",
-    "  timer <s> [label]    spawn a new countdown task at runtime",
-    "  mandel               Mandelbrot set, timed in CPU cycles",
-    "  life                 Conway's Game of Life",
-    "  matrix               digital rain",
-    "  dump <addr> [len]    hex dump of real memory (dump with no args for examples)",
-    "  say <text>           Ferris the crab says it",
-    "  fortune              words of wisdom",
-    "",
-    "Keys: up/down = history, Ctrl+C = cancel line",
+/// One shell command: its name, how to call it and what it does. `help` and tab completion
+/// are generated from these tables; `Shell::run_command` dispatches on the name.
+pub(crate) struct Command {
+    pub name: &'static str,
+    pub args: &'static str,
+    pub help: &'static str,
+    /// Words that tab completion offers for the first argument.
+    pub completions: &'static [&'static str],
+}
+
+const fn cmd(name: &'static str, args: &'static str, help: &'static str) -> Command {
+    Command { name, args, help, completions: &[] }
+}
+
+const LED_MODES: &[&str] = &["on", "off", "blink", "heartbeat", "morse"];
+
+pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
+    cmd("help", "[command]", "show this help, or the help for one command"),
+    cmd("info", "", "board, chip, clock, uptime and reset reason"),
+    cmd("ps", "", "list running tasks and their wakeups"),
+    Command { completions: LED_MODES, ..cmd("led", "<mode>", "on | off | blink [ms] | heartbeat | morse <text>") },
+    cmd("temp", "", "on-chip temperature (and supply voltage)"),
+    cmd("watch", "", "live temperature graph (press any key to stop)"),
+    cmd("alert", "<celsius>", "set the temperature alert threshold"),
+    cmd("uptime", "", "time since boot"),
+    cmd("history", "", "list the previous command lines"),
+    cmd("echo", "<text>", "print the text"),
+    cmd("hang", "", "freeze the executor -> watchdog resets the system"),
+    cmd("reboot", "", "restart"),
+    cmd("clear", "", "clear the screen"),
 ];
+
+pub(crate) const FUN_COMMANDS: &[Command] = &[
+    cmd("reaction", "", "reflex game: hit the button when the LED turns on"),
+    Command {
+        completions: &["d6", "2d6", "d20"],
+        ..cmd("roll", "[N]dM", "roll dice with the RNG (roll 2d6, roll d20)")
+    },
+    cmd("timer", "<s> [label]", "spawn a new countdown task at runtime"),
+    cmd("mandel", "", "Mandelbrot set, timed in CPU cycles"),
+    cmd("life", "", "Conway's Game of Life"),
+    cmd("matrix", "", "digital rain"),
+    cmd("dump", "<addr> [len]", "hex dump of real memory (dump with no args for examples)"),
+    cmd("say", "<text>", "Ferris the crab says it"),
+    cmd("fortune", "", "words of wisdom"),
+];
+
+/// Names of every command, in help order (for tab completion of the first word).
+const COMMAND_NAMES: [&str; SYSTEM_COMMANDS.len() + FUN_COMMANDS.len()] = {
+    let mut names = [""; SYSTEM_COMMANDS.len() + FUN_COMMANDS.len()];
+    let mut i = 0;
+    while i < SYSTEM_COMMANDS.len() {
+        names[i] = SYSTEM_COMMANDS[i].name;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < FUN_COMMANDS.len() {
+        names[i + j] = FUN_COMMANDS[j].name;
+        j += 1;
+    }
+    names
+};
+
+pub(crate) fn find_command(name: &str) -> Option<&'static Command> {
+    SYSTEM_COMMANDS.iter().chain(FUN_COMMANDS).find(|c| c.name == name)
+}
+
+/// Tab completion: command names for the first word, the command's own list after it.
+pub(crate) fn complete(context: &str) -> &'static [&'static str] {
+    let mut words = context.split_whitespace();
+    match (words.next(), words.next()) {
+        (None, _) => &COMMAND_NAMES,
+        (Some("help"), None) => &COMMAND_NAMES,
+        (Some(name), None) => find_command(name).map_or(&[], |c| c.completions),
+        _ => &[],
+    }
+}
+
+const KEYS_HELP: &str = "Keys: Tab = complete, up/down = history, left/right/Home/End = move,\r\n      \
+                         Ctrl+W/U/K = delete word/to start/to end, Ctrl+L = clear, Ctrl+C = cancel\r\n";
 
 /// Shell state. The fun commands live in `fun.rs` as another `impl` block.
 pub struct Shell<S: System, R: Read, W: Write> {
@@ -65,6 +117,7 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) rx: R,
     pub(crate) term: Term<W>,
     pub(crate) spawner: Spawner,
+    editor: Editor,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -72,19 +125,13 @@ pub struct Shell<S: System, R: Read, W: Write> {
 /// `rx` must be cancel-safe: dropping a pending `read` must not lose bytes (ring buffers,
 /// pipes and buffered UARTs are fine).
 pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Spawner) -> ! {
-    let mut shell = Shell { sys, rx, term: Term::new(tx), spawner };
+    let mut shell = Shell { sys, rx, term: Term::new(tx), spawner, editor: Editor::new(PROMPT, complete) };
     shell.main_loop().await
 }
 
 fn uptime_parts() -> (u64, u64, u64, u64) {
     let ms = Instant::now().as_millis();
     (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60, ms % 1000)
-}
-
-enum Escape {
-    None,
-    Esc,
-    Csi,
 }
 
 impl<S: System, R: Read, W: Write> Shell<S, R, W> {
@@ -116,90 +163,29 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         self.term.print("  type 'help' to get started\r\n\r\n").await;
     }
 
-    async fn redraw_line(&mut self, line: &str) {
-        self.term.print("\r").await;
-        self.term.print(PROMPT).await;
-        self.term.print(line).await;
-        self.term.print("\x1b[K").await;
+    /// Prints the output of the line editor.
+    async fn emit(&mut self, out: &Out) {
+        self.term.print(out).await;
     }
 
     async fn main_loop(&mut self) -> ! {
         self.banner().await;
         self.term.print(PROMPT).await;
+        self.term.flush().await;
 
-        let mut line: String<LINE_MAX> = String::new();
-        let mut history: Vec<String<LINE_MAX>, HISTORY> = Vec::new();
-        let mut cursor = 0; // position in history while browsing with the arrow keys
-        let mut escape = Escape::None;
-        let mut last_was_cr = false;
         let mut buf = [0u8; 32];
-
         loop {
             // Wait for whichever comes first: keyboard input or an event from another task.
             match select(self.rx.read(&mut buf), EVENTS.receive()).await {
                 Either::First(Ok(n)) => {
                     STAT_SHELL.tick();
                     for &b in &buf[..n] {
-                        // Arrow keys arrive as ESC [ A / ESC [ B.
-                        match escape {
-                            Escape::Esc => {
-                                escape = if b == b'[' { Escape::Csi } else { Escape::None };
-                                continue;
-                            }
-                            Escape::Csi => {
-                                if (0x40..=0x7e).contains(&b) {
-                                    escape = Escape::None;
-                                    let target = match b {
-                                        b'A' if cursor > 0 => Some(cursor - 1),
-                                        b'B' if cursor < history.len() => Some(cursor + 1),
-                                        _ => None,
-                                    };
-                                    if let Some(target) = target {
-                                        cursor = target;
-                                        line = history.get(cursor).cloned().unwrap_or_default();
-                                        self.redraw_line(&line).await;
-                                    }
-                                }
-                                continue;
-                            }
-                            Escape::None => {}
-                        }
-
-                        let was_cr = core::mem::replace(&mut last_was_cr, b == b'\r');
-                        match b {
-                            0x1b => escape = Escape::Esc,
-                            b'\n' if was_cr => {} // CR LF counts as one Enter
-                            b'\r' | b'\n' => {
-                                self.term.print("\r\n").await;
-                                let cmd = core::mem::take(&mut line);
-                                let cmd = cmd.trim();
-                                if !cmd.is_empty() && history.last().map(|h| h.as_str()) != Some(cmd) {
-                                    if history.is_full() {
-                                        history.remove(0);
-                                    }
-                                    let _ = history.push(String::try_from(cmd).unwrap_or_default());
-                                }
-                                cursor = history.len();
-                                self.run_command(cmd).await;
-                                self.term.print(PROMPT).await;
-                            }
-                            0x03 => {
-                                self.term.print("^C\r\n").await;
-                                line.clear();
-                                cursor = history.len();
-                                self.term.print(PROMPT).await;
-                            }
-                            0x08 | 0x7f => {
-                                if line.pop().is_some() {
-                                    self.term.print("\x08 \x08").await;
-                                }
-                            }
-                            0x20..=0x7e => {
-                                if line.push(b as char).is_ok() {
-                                    self.term.write_bytes(&[b]).await;
-                                }
-                            }
-                            _ => {}
+                        let mut out = Out::new();
+                        let submitted = self.editor.feed(b, &mut out);
+                        self.emit(&out).await;
+                        if let Some(line) = submitted {
+                            self.run_command(line.trim()).await;
+                            self.term.print(PROMPT).await;
                         }
                     }
                 }
@@ -207,8 +193,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 Either::Second(event) => {
                     STAT_SHELL.tick();
                     self.print_event(event).await;
-                    self.term.print(PROMPT).await;
-                    self.term.print(&line).await;
+                    let mut out = Out::new();
+                    self.editor.redraw(&mut out);
+                    self.emit(&out).await;
                 }
             }
             self.term.flush().await;
@@ -238,10 +225,20 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let Some(cmd) = args.next() else { return };
 
         match cmd {
-            "help" => {
-                self.term.print_lines(HELP).await;
-                let button = self.sys.info().button;
-                out!(self.term, "Press {button} to cycle LED modes.\r\n");
+            "help" => self.cmd_help(args.next()).await,
+            "history" => {
+                for (i, entry) in self.editor.history().enumerate() {
+                    out!(self.term, "  {:>2}  {entry}\r\n", i + 1);
+                }
+            }
+            "echo" => {
+                for (i, word) in args.enumerate() {
+                    if i > 0 {
+                        self.term.print(" ").await;
+                    }
+                    self.term.print(word).await;
+                }
+                self.term.print("\r\n").await;
             }
             "info" => self.cmd_info().await,
             "ps" => self.cmd_ps().await,
@@ -294,6 +291,36 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "fortune" => self.cmd_fortune().await,
             other => out!(self.term, "unknown command: '{other}' (try 'help')\r\n"),
         }
+    }
+
+    async fn cmd_help(&mut self, topic: Option<&str>) {
+        if let Some(topic) = topic {
+            match find_command(topic) {
+                Some(c) => self.print_usage(c).await,
+                None => out!(self.term, "no such command: '{topic}'\r\n"),
+            }
+            return;
+        }
+        for (title, commands) in [("System:", SYSTEM_COMMANDS), ("Fun:", FUN_COMMANDS)] {
+            out!(self.term, "{title}\r\n");
+            for c in commands {
+                self.print_usage(c).await;
+            }
+            self.term.print("\r\n").await;
+        }
+        self.term.print(KEYS_HELP).await;
+        let button = self.sys.info().button;
+        out!(self.term, "Press {button} to cycle LED modes.\r\n");
+    }
+
+    async fn print_usage(&mut self, c: &Command) {
+        let mut call: String<32> = String::new();
+        let _ = call.push_str(c.name);
+        if !c.args.is_empty() {
+            let _ = call.push(' ');
+            let _ = call.push_str(c.args);
+        }
+        out!(self.term, "  {:<20} {}\r\n", call.as_str(), c.help);
     }
 
     async fn cmd_info(&mut self) {
@@ -389,5 +416,45 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
         }
         self.term.print("\r\n").await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use std::format;
+
+    #[test]
+    fn command_names_are_unique() {
+        for (i, a) in COMMAND_NAMES.iter().enumerate() {
+            assert!(!COMMAND_NAMES[i + 1..].contains(a), "'{a}' is listed twice");
+        }
+    }
+
+    #[test]
+    fn every_listed_command_is_dispatched() {
+        // Cheap guard against adding a table entry but forgetting the `match` arm.
+        let source = include_str!("shell.rs");
+        let dispatch = &source[source.find("match cmd {").unwrap()..];
+        for name in COMMAND_NAMES {
+            assert!(dispatch.contains(&format!("\"{name}\" =>")), "'{name}' is not handled by run_command");
+        }
+    }
+
+    #[test]
+    fn usage_fits_the_help_column() {
+        for c in SYSTEM_COMMANDS.iter().chain(FUN_COMMANDS) {
+            assert!(c.name.len() + 1 + c.args.len() <= 20, "usage of '{}' is too long", c.name);
+        }
+    }
+
+    #[test]
+    fn completion_contexts() {
+        assert_eq!(complete("").len(), COMMAND_NAMES.len());
+        assert_eq!(complete("help ").len(), COMMAND_NAMES.len());
+        assert_eq!(complete("led "), LED_MODES);
+        assert!(complete("led blink ").is_empty());
+        assert!(complete("nope ").is_empty());
     }
 }

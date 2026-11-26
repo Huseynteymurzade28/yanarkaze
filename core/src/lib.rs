@@ -14,6 +14,7 @@
 
 #[macro_use]
 mod term;
+mod editor;
 mod fun;
 mod state;
 

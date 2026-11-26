@@ -30,7 +30,8 @@ commands run on an STM32, an RP2040, an nRF52840, an ESP32-C3, and even in your 
 ```
 core/                    yanarkaze-core: no_std, no hardware
   platform.rs            the traits a board implements: Led, Button, Sensor, Watchdog, System
-  shell.rs               line editing, history, built-in commands
+  shell.rs               command table, built-in commands, event printing
+  editor.rs              line editor: cursor keys, history, tab completion (pure, unit tested)
   fun.rs                 reaction game, dice, timers, mandelbrot, life, matrix, dump, ferris
   led.rs button.rs       task logic, generic over the traits
   sensor.rs watchdog.rs
@@ -74,7 +75,7 @@ that the shell prints asynchronously, and mutex-protected shared readings.
 
 ```
 System:
-  help                 show this help
+  help [command]       show this help, or the help for one command
   info                 board, chip, clock, uptime and reset reason
   ps                   list running tasks and their wakeups
   led <mode>           on | off | blink [ms] | heartbeat | morse <text>
@@ -82,6 +83,8 @@ System:
   watch                live temperature graph (press any key to stop)
   alert <celsius>      set the temperature alert threshold
   uptime               time since boot
+  history              list the previous command lines
+  echo <text>          print the text
   hang                 freeze the executor -> watchdog resets the system
   reboot               restart
   clear                clear the screen
@@ -98,7 +101,21 @@ Fun:
   fortune              words of wisdom
 ```
 
-Up/down arrows browse the history, Ctrl+C cancels the current line.
+Line editing keys:
+
+| Key                          | Action                                   |
+|------------------------------|------------------------------------------|
+| Tab                          | complete commands and arguments (`led he<Tab>`) |
+| left / right                 | move the cursor                          |
+| Home, Ctrl+A / End, Ctrl+E   | jump to the start / end of the line      |
+| Backspace / Delete           | delete before / under the cursor         |
+| Ctrl+W / Ctrl+U / Ctrl+K     | delete the word before / to start / to end |
+| up, Ctrl+P / down, Ctrl+N    | browse the history (the half-typed line is kept) |
+| Ctrl+L                       | clear the screen                         |
+| Ctrl+C                       | cancel the line                          |
+
+`help` and tab completion are generated from the command tables in `core/src/shell.rs`; a
+test fails if a table entry has no handler.
 
 ## Running it
 
