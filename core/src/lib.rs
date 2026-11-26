@@ -16,6 +16,8 @@
 mod term;
 mod editor;
 mod fun;
+mod keys;
+mod snake;
 mod state;
 
 pub mod button;

@@ -28,6 +28,8 @@ jobs:
             target: thumbv7em-none-eabihf
           - board: rp-pico
             target: thumbv6m-none-eabi
+          - board: rp-pico2
+            target: thumbv8m.main-none-eabihf
           - board: nrf52840-dk
             target: thumbv7em-none-eabihf
           - board: esp32c3

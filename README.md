@@ -22,6 +22,7 @@ commands run on an STM32, an RP2040, an nRF52840, an ESP32-C3, and even in your 
 | Desktop simulator        | your PC (Linux, macOS, Windows)| the terminal            | tested                   |
 | ST NUCLEO-L452RE         | STM32L452, Cortex-M4F 80 MHz   | ST-LINK VCP (USART2)    | tested on hardware       |
 | Raspberry Pi Pico        | RP2040, Cortex-M0+ 125 MHz     | native USB (CDC-ACM)    | builds, awaiting testing |
+| Raspberry Pi Pico 2      | RP2350, Cortex-M33F 150 MHz    | native USB (CDC-ACM)    | tested on hardware       |
 | Nordic nRF52840-DK       | nRF52840, Cortex-M4F 64 MHz    | J-Link VCP (UARTE0)     | builds, untested         |
 | ESP32-C3                 | RISC-V RV32IMC 160 MHz         | built-in USB Serial/JTAG| builds, untested         |
 
@@ -32,14 +33,17 @@ core/                    yanarkaze-core: no_std, no hardware
   platform.rs            the traits a board implements: Led, Button, Sensor, Watchdog, System
   shell.rs               command table, built-in commands, event printing
   editor.rs              line editor: cursor keys, history, tab completion (pure, unit tested)
-  fun.rs                 reaction game, dice, timers, mandelbrot, life, matrix, dump, ferris
+  keys.rs                decodes terminal bytes into keys for full-screen programs
+  snake.rs               the rules of Snake, reporting only the cells that changed
+  fun.rs                 reaction game, snake, dice, timers, mandelbrot, life, matrix, dump, ferris
   led.rs button.rs       task logic, generic over the traits
   sensor.rs watchdog.rs
   state.rs               shared state: Signal, Channel, Mutex, task statistics
 boards/
   sim/                   std: raw-mode terminal, threads stand in for hardware
   nucleo-l452re/         embassy-stm32
-  rp-pico/               embassy-rp + embassy-usb
+  rp-pico/               embassy-rp + embassy-usb (RP2040)
+  rp-pico2/              embassy-rp + embassy-usb (RP2350, Arm cores)
   nrf52840-dk/           embassy-nrf
   esp32c3/               esp-hal + esp-rtos
 ```
@@ -78,6 +82,7 @@ System:
   help [command]       show this help, or the help for one command
   info                 board, chip, clock, uptime and reset reason
   ps                   list running tasks and their wakeups
+  top                  live task monitor with wakeups per second (any key stops)
   led <mode>           on | off | blink [ms] | heartbeat | morse <text>
   temp                 on-chip temperature (and supply voltage)
   watch                live temperature graph (press any key to stop)
@@ -87,6 +92,7 @@ System:
   echo <text>          print the text
   hang                 freeze the executor -> watchdog resets the system
   reboot               restart
+  bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
   clear                clear the screen
 
 Fun:
@@ -96,6 +102,7 @@ Fun:
   mandel               Mandelbrot set, timed in CPU cycles
   life                 Conway's Game of Life
   matrix               digital rain
+  snake                the classic, with arrow keys (the button pauses)
   dump <addr> [len]    hex dump of real memory (dump with no args for examples)
   say <text>           Ferris the crab says it
   fortune              words of wisdom
@@ -152,6 +159,34 @@ picocom /dev/ttyACM0             # the Pico shows up as a USB serial port
 
 The Pico has no user button, so BOOTSEL doubles as the button once the firmware runs.
 
+### Raspberry Pi Pico 2
+
+Requires `rustup target add thumbv8m.main-none-eabihf`. Hold BOOTSEL while plugging the Pico 2
+in, then either:
+
+```sh
+cd boards/rp-pico2
+cargo run --release              # flashes with picotool
+```
+
+or, if picotool cannot reach the board (no udev rule), drag and drop a UF2:
+
+```sh
+cargo build --release
+picotool uf2 convert target/thumbv8m.main-none-eabihf/release/yanarkaze-rp-pico2 -t elf \
+    pico2.uf2 --family rp2350-arm-s
+cp pico2.uf2 /run/media/$USER/RP2350/  # the drive the Pico 2 shows in BOOTSEL mode
+picocom /dev/ttyACM0
+```
+
+After the first flash, the `bootloader` shell command brings the board back to BOOTSEL mode,
+so updates need no replugging.
+
+embassy-rp can only read the BOOTSEL button on the RP2040, so on the Pico 2 the button is
+GPIO15 (pin 20) with the internal pull-up: touch it to GND (pin 18), or wire a push button
+between them. `mandel` measures in CPU cycles here too, and the M33's FPU makes it fast
+(about 9 ms for the whole set).
+
 ### nRF52840-DK
 
 ```sh
@@ -184,8 +219,10 @@ cargo test -p yanarkaze-core
 1. `led morse HELLO` and keep typing commands while the LED blinks: tasks run concurrently.
 2. `alert 30`, then put your finger on the MCU: an `[alert]` event pops up in the shell.
 3. `timer 5 tea`, `timer 8 coffee`, then `ps`: new tasks spawned while the system runs.
-4. `mandel` on the Nucleo and on the Pico: hardware FPU vs. software floats.
-5. `hang` blocks the cooperative executor. Nobody feeds the watchdog, the system resets and
+4. `mandel` on the Pico 2 and on the Pico: hardware FPU vs. software floats.
+5. `snake`, then press the board's button: it pauses the game and the LED starts blinking.
+   `top` in between shows which tasks woke up and how often.
+6. `hang` blocks the cooperative executor. Nobody feeds the watchdog, the system resets and
    the banner reports why.
 
 ## Notes

@@ -6,18 +6,21 @@
 //!   timer                         -> spawning new tasks at runtime from a task pool
 //!   mandel                        -> floating point speed, timed in CPU cycles
 //!   dump                          -> raw memory access (flash, RAM, factory data)
+//!   snake                         -> key decoding, partial redraws, the button as pause
 //!   say                           -> Ferris the crab, because Rust
 
 use core::fmt::Write as _;
 
 use embassy_futures::select::{Either3, select3};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
 use portable_atomic::{AtomicU32, Ordering};
 
+use crate::keys::{Key, KeyDecoder};
 use crate::platform::System;
 use crate::shell::Shell;
+use crate::snake::{self, Dir, Game, Pos, Step};
 use crate::state::{BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, LedMode, current_led_mode, set_led_mode};
 use crate::term::Term;
 
@@ -25,6 +28,7 @@ pub const TIMER_SLOTS: u32 = 4;
 pub static ACTIVE_TIMERS: AtomicU32 = AtomicU32::new(0);
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
 static BEST_REACTION_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+static BEST_SNAKE: AtomicU32 = AtomicU32::new(0);
 
 /// Up to TIMER_SLOTS of these can exist at once. Their memory is reserved at compile time,
 /// so spawning one never allocates.
@@ -419,6 +423,131 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 ascii.as_str()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // snake
+    // -----------------------------------------------------------------------
+
+    /// Prints `text` at board cell `p` (each cell is two columns wide).
+    async fn snake_cell(&mut self, p: Pos, text: &str) {
+        out!(self.term, "\x1b[{};{}H{text}", p.y as u32 + 3, p.x as u32 * 2 + 2);
+    }
+
+    async fn snake_status(&mut self, score: u32, note: &str) {
+        let best = BEST_SNAKE.load(Ordering::Relaxed).max(score);
+        out!(self.term, "\x1b[1;1H\x1b[1;32mSNAKE\x1b[0m  score {score:<4} best {best:<4} {note}\x1b[K");
+    }
+
+    pub(crate) async fn cmd_snake(&mut self) {
+        const BODY: &str = "\x1b[32m\u{2588}\u{2588}\x1b[0m";
+        const HEAD: &str = "\x1b[1;92m\u{2588}\u{2588}\x1b[0m";
+        const FOOD: &str = "\x1b[1;91m()\x1b[0m";
+        const KEYS: &str = "\x1b[2marrows/WASD/hjkl steer, p or the button pauses, q quits\x1b[0m";
+
+        let mut game = Game::new(|| self.sys.random_u32());
+
+        // Frame: status line, then the board inside a box.
+        self.term.print("\x1b[2J\x1b[?25l").await;
+        self.snake_status(0, KEYS).await;
+        let mut edge: String<160> = String::new();
+        for _ in 0..snake::W as usize * 2 {
+            let _ = edge.push('\u{2500}');
+        }
+        out!(self.term, "\x1b[2;1H\u{250c}{}\u{2510}", edge.as_str());
+        for y in 0..snake::H as u32 {
+            out!(self.term, "\x1b[{};1H\u{2502}\x1b[{}G\u{2502}", y + 3, snake::W as u32 * 2 + 2);
+        }
+        out!(self.term, "\x1b[{};1H\u{2514}{}\u{2518}", snake::H as u32 + 3, edge.as_str());
+        let body: heapless::Vec<Pos, 3> = game.body().collect();
+        for (i, &p) in body.iter().enumerate() {
+            self.snake_cell(p, if i == 0 { HEAD } else { BODY }).await;
+        }
+        self.snake_cell(game.food(), FOOD).await;
+        self.term.flush().await;
+
+        let previous_mode = current_led_mode();
+        GAME_ACTIVE.store(true, Ordering::Relaxed); // the button pauses instead of cycling LED modes
+        BUTTON_SIGNAL.reset();
+        set_led_mode(LedMode::On);
+
+        let mut keys = KeyDecoder::new();
+        let mut tick = Duration::from_millis(170);
+        let mut next_tick = Instant::now() + tick;
+        let mut paused = false;
+        let mut buf = [0u8; 16];
+        let outcome = 'game: loop {
+            let deadline = if paused { Instant::MAX } else { next_tick };
+            let mut toggle_pause = false;
+            match select3(self.rx.read(&mut buf), Timer::at(deadline), BUTTON_SIGNAL.wait()).await {
+                Either3::First(Ok(n)) => {
+                    for &b in &buf[..n] {
+                        let dir = match keys.feed(b) {
+                            Some(Key::Up | Key::Char(b'w' | b'W' | b'k')) => Dir::Up,
+                            Some(Key::Down | Key::Char(b's' | b'S' | b'j')) => Dir::Down,
+                            Some(Key::Left | Key::Char(b'a' | b'A' | b'h')) => Dir::Left,
+                            Some(Key::Right | Key::Char(b'd' | b'D' | b'l')) => Dir::Right,
+                            Some(Key::Char(b'p' | b'P' | b' ')) => {
+                                toggle_pause = true;
+                                continue;
+                            }
+                            Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game "quit",
+                            _ => continue,
+                        };
+                        if !paused {
+                            game.steer(dir);
+                        }
+                    }
+                }
+                Either3::First(Err(_)) => Timer::at(deadline.min(Instant::now() + tick)).await,
+                Either3::Second(()) => {
+                    match game.step(|| self.sys.random_u32()) {
+                        Step::Moved { head, old_head, tail, food } => {
+                            if let Some(tail) = tail {
+                                self.snake_cell(tail, "  ").await;
+                            }
+                            self.snake_cell(old_head, BODY).await;
+                            self.snake_cell(head, HEAD).await;
+                            if let Some(food) = food {
+                                self.snake_cell(food, FOOD).await;
+                                self.snake_status(game.score(), KEYS).await;
+                                // A little faster with every bite.
+                                tick = (tick - Duration::from_millis(5)).max(Duration::from_millis(70));
+                            }
+                        }
+                        Step::Crashed => break 'game "\x1b[1;31mGAME OVER\x1b[0m",
+                        Step::Won => break 'game "\x1b[1;33mYOU WIN!\x1b[0m",
+                    }
+                    self.term.flush().await;
+                    next_tick = Instant::now() + tick;
+                }
+                Either3::Third(_) => toggle_pause = true,
+            }
+            if toggle_pause {
+                paused = !paused;
+                if paused {
+                    set_led_mode(LedMode::Blink(250));
+                    self.snake_status(game.score(), "\x1b[1;33mPAUSED\x1b[0m - p or the button resumes").await;
+                } else {
+                    set_led_mode(LedMode::On);
+                    self.snake_status(game.score(), KEYS).await;
+                    next_tick = Instant::now() + tick;
+                }
+                self.term.flush().await;
+            }
+        };
+
+        GAME_ACTIVE.store(false, Ordering::Relaxed);
+        set_led_mode(previous_mode);
+        let score = game.score();
+        let best = BEST_SNAKE.fetch_max(score, Ordering::Relaxed).max(score);
+        let record = if score > 0 && score == best { "  \x1b[1;33mnew best!\x1b[0m" } else { "" };
+        out!(
+            self.term,
+            "\x1b[{};1H\x1b[?25h{outcome}  score {score}, length {}, best {best}{record}\r\n",
+            snake::H as u32 + 4,
+            game.len()
+        );
     }
 
     // -----------------------------------------------------------------------

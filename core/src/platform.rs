@@ -92,6 +92,10 @@ pub trait System {
     /// Restarts the system.
     fn reset(&mut self) -> !;
 
+    /// Restarts into the chip's bootloader so new firmware can be flashed without pressing
+    /// any buttons. Returns only if the board cannot do that.
+    fn enter_bootloader(&mut self) {}
+
     /// Blocks forever without yielding to the executor, so the watchdog fires.
     fn hang(&mut self) -> ! {
         loop {

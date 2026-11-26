@@ -1,5 +1,7 @@
 //! The interactive shell: line editing, history, built-in commands and event printing.
 
+use core::fmt::Write as _;
+
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_time::{Instant, Timer};
@@ -50,6 +52,7 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     cmd("help", "[command]", "show this help, or the help for one command"),
     cmd("info", "", "board, chip, clock, uptime and reset reason"),
     cmd("ps", "", "list running tasks and their wakeups"),
+    cmd("top", "", "live task monitor with wakeups per second (any key stops)"),
     Command { completions: LED_MODES, ..cmd("led", "<mode>", "on | off | blink [ms] | heartbeat | morse <text>") },
     cmd("temp", "", "on-chip temperature (and supply voltage)"),
     cmd("watch", "", "live temperature graph (press any key to stop)"),
@@ -59,6 +62,7 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     cmd("echo", "<text>", "print the text"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
+    cmd("bootloader", "", "restart into the USB bootloader, ready for new firmware"),
     cmd("clear", "", "clear the screen"),
 ];
 
@@ -72,6 +76,7 @@ pub(crate) const FUN_COMMANDS: &[Command] = &[
     cmd("mandel", "", "Mandelbrot set, timed in CPU cycles"),
     cmd("life", "", "Conway's Game of Life"),
     cmd("matrix", "", "digital rain"),
+    cmd("snake", "", "the classic, with arrow keys (the button pauses)"),
     cmd("dump", "<addr> [len]", "hex dump of real memory (dump with no args for examples)"),
     cmd("say", "<text>", "Ferris the crab says it"),
     cmd("fortune", "", "words of wisdom"),
@@ -242,6 +247,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
             "info" => self.cmd_info().await,
             "ps" => self.cmd_ps().await,
+            "top" => self.cmd_top().await,
             "led" => self.cmd_led(args).await,
             "temp" => {
                 let sample = SAMPLE.lock(|s| s.get());
@@ -279,6 +285,13 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 Timer::after_millis(20).await;
                 self.sys.reset();
             }
+            "bootloader" => {
+                self.term.print("restarting into the bootloader, see you after the update...\r\n").await;
+                self.term.flush().await;
+                Timer::after_millis(50).await; // let the output drain
+                self.sys.enter_bootloader();
+                self.term.print("this board has no bootloader the shell can start\r\n").await;
+            }
             "clear" => self.term.print("\x1b[2J\x1b[H").await,
             "reaction" => self.cmd_reaction().await,
             "roll" => self.cmd_roll(args.next()).await,
@@ -286,6 +299,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "mandel" => self.cmd_mandel().await,
             "life" => self.cmd_life().await,
             "matrix" => self.cmd_matrix().await,
+            "snake" => self.cmd_snake().await,
             "dump" => self.cmd_dump(args).await,
             "say" => fun::say(&mut self.term, args).await,
             "fortune" => self.cmd_fortune().await,
@@ -363,6 +377,71 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let timers = fun::ACTIVE_TIMERS.load(Ordering::Relaxed);
         out!(t, "  {:<10} {:>10}  {}/{} slots running\r\n", "countdown", "-", timers, fun::TIMER_SLOTS);
         out!(t, "  button presses: {}\r\n", BUTTON_PRESSES.load(Ordering::Relaxed));
+    }
+
+    async fn cmd_top(&mut self) {
+        const REFRESH_MS: u64 = 1000;
+        let mut previous = [0u32; STATS.len()];
+        for (prev, stat) in previous.iter_mut().zip(STATS.iter()) {
+            *prev = stat.wakeups();
+        }
+        let mut last = Instant::now();
+        self.term.print("\x1b[2J\x1b[?25l").await;
+        for frame in 0u32.. {
+            let (h, m, s, _) = uptime_parts();
+            let elapsed_ms = last.elapsed().as_millis().max(1);
+            last = Instant::now();
+            let sample = SAMPLE.lock(|s| s.get());
+            let led = current_led_mode();
+            let board = self.sys.info().board;
+            let t = &mut self.term;
+
+            out!(t, "\x1b[H\x1b[1;38;5;208myanarkaze\x1b[0m top - {board} - up {h:02}:{m:02}:{s:02}\x1b[K\r\n");
+            out!(
+                t,
+                "temp {:.1} C (alert {:.1} C)   led {}   button presses {}\x1b[K\r\n\x1b[K\r\n",
+                sample.reading.temp_c,
+                alert_limit_c(),
+                led.name(),
+                BUTTON_PRESSES.load(Ordering::Relaxed)
+            );
+            out!(t, "\x1b[7m  {:<10} {:>10} {:>8}  {:<22}\x1b[0m\r\n", "TASK", "WAKEUPS", "PER SEC", "ACTIVITY");
+            for (prev, stat) in previous.iter_mut().zip(STATS.iter()) {
+                let now = stat.wakeups();
+                let delta = now.wrapping_sub(*prev);
+                *prev = now;
+                let per_sec = delta as u64 * 1000 / elapsed_ms;
+                let mut rate: String<12> = String::new();
+                if frame == 0 {
+                    let _ = rate.push('-'); // no interval to measure yet
+                } else {
+                    let _ = write!(rate, "{per_sec}");
+                }
+                // Log-ish bar: 1, 2, 4, 8, ... wakeups per second each add one block.
+                let mut bar: String<64> = String::new();
+                let mut v = per_sec;
+                while v > 0 && bar.len() < 60 {
+                    let _ = bar.push('\u{25a0}');
+                    v /= 2;
+                }
+                out!(
+                    t,
+                    "  {:<10} {:>10} {:>8}  \x1b[36m{}\x1b[0m\x1b[K\r\n",
+                    stat.name,
+                    now,
+                    rate.as_str(),
+                    bar.as_str()
+                );
+            }
+            let timers = fun::ACTIVE_TIMERS.load(Ordering::Relaxed);
+            out!(t, "  {:<10} {:>10} {:>8}  {}/{} running\x1b[K\r\n", "countdown", "-", "-", timers, fun::TIMER_SLOTS);
+            out!(t, "\x1b[K\r\n\x1b[2many key stops\x1b[0m\x1b[K");
+            self.term.flush().await;
+            if self.key_or_timeout(REFRESH_MS).await {
+                break;
+            }
+        }
+        self.term.print("\x1b[?25h\r\n").await;
     }
 
     async fn cmd_led<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {

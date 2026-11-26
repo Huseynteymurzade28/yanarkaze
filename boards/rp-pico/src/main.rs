@@ -204,6 +204,11 @@ impl System for PicoSystem {
         &REGIONS
     }
 
+    fn enter_bootloader(&mut self) {
+        // Shows up as a USB drive (and to picotool) again, as if BOOTSEL had been held.
+        embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+    }
+
     fn reset(&mut self) -> ! {
         cortex_m::peripheral::SCB::sys_reset()
     }

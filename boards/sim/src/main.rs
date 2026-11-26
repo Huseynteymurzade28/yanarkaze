@@ -157,7 +157,11 @@ impl Button for KeyboardButton {
         BUTTON.wait().await;
     }
 
-    async fn wait_for_release(&mut self) {}
+    /// A key press has no "up" event, so it acts like a button held for 60 ms (long enough
+    /// for the core's debouncing to accept it).
+    async fn wait_for_release(&mut self) {
+        embassy_time::Timer::after_millis(60).await;
+    }
 }
 
 /// xorshift64*: plenty for dice and the matrix rain.

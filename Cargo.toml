@@ -6,7 +6,7 @@
 [workspace]
 resolver = "3"
 members = ["core", "boards/sim"]
-exclude = ["boards/nucleo-l452re", "boards/rp-pico", "boards/nrf52840-dk", "boards/esp32c3"]
+exclude = ["boards/nucleo-l452re", "boards/rp-pico", "boards/rp-pico2", "boards/nrf52840-dk", "boards/esp32c3"]
 
 [workspace.package]
 version = "0.1.0"
