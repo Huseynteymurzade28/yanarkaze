@@ -14,8 +14,10 @@
 
 #[macro_use]
 mod term;
+mod calc;
 mod editor;
 mod fun;
+mod game2048;
 mod keys;
 mod snake;
 mod state;

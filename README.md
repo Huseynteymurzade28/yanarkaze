@@ -35,6 +35,8 @@ core/                    yanarkaze-core: no_std, no hardware
   editor.rs              line editor: cursor keys, history, tab completion (pure, unit tested)
   keys.rs                decodes terminal bytes into keys for full-screen programs
   snake.rs               the rules of Snake, reporting only the cells that changed
+  game2048.rs            the rules of 2048
+  calc.rs                expression evaluator for `calc` (C operators, hex, binary)
   fun.rs                 reaction game, snake, dice, timers, mandelbrot, life, matrix, dump, ferris
   led.rs button.rs       task logic, generic over the traits
   sensor.rs watchdog.rs
@@ -85,11 +87,15 @@ System:
   top                  live task monitor with wakeups per second (any key stops)
   led <mode>           on | off | blink [ms] | heartbeat | morse <text>
   temp                 on-chip temperature (and supply voltage)
-  watch                live temperature graph (press any key to stop)
+  watch                live temperature bar (press any key to stop)
+  graph                live chart of the last minute's temperature (any key stops)
   alert <celsius>      set the temperature alert threshold
   uptime               time since boot
   history              list the previous command lines
   echo <text>          print the text
+  calc <expr>          calculator: 0xff & ~0x0f, 1 << 12, 7 / 2, (3 + 4) * 2
+  repeat <n> <cmd>     run a command n times (any key stops)
+  every <s> <cmd>      run a command every s seconds (any key stops)
   hang                 freeze the executor -> watchdog resets the system
   reboot               restart
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
@@ -103,6 +109,7 @@ Fun:
   life                 Conway's Game of Life
   matrix               digital rain
   snake                the classic, with arrow keys (the button pauses)
+  2048                 slide and merge tiles with the arrow keys
   dump <addr> [len]    hex dump of real memory (dump with no args for examples)
   say <text>           Ferris the crab says it
   fortune              words of wisdom
@@ -120,6 +127,9 @@ Line editing keys:
 | up, Ctrl+P / down, Ctrl+N    | browse the history (the half-typed line is kept) |
 | Ctrl+L                       | clear the screen                         |
 | Ctrl+C                       | cancel the line                          |
+
+Commands can be chained with `;` (`led on; temp`), and `repeat` / `every` wrap one
+(`every 1 temp`, `repeat 5 roll d20`).
 
 `help` and tab completion are generated from the command tables in `core/src/shell.rs`; a
 test fails if a table entry has no handler.

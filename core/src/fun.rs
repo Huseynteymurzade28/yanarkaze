@@ -7,6 +7,7 @@
 //!   mandel                        -> floating point speed, timed in CPU cycles
 //!   dump                          -> raw memory access (flash, RAM, factory data)
 //!   snake                         -> key decoding, partial redraws, the button as pause
+//!   2048                          -> the same key decoder, 256-colour tiles
 //!   say                           -> Ferris the crab, because Rust
 
 use core::fmt::Write as _;
@@ -17,6 +18,7 @@ use embedded_io_async::{Read, Write};
 use heapless::String;
 use portable_atomic::{AtomicU32, Ordering};
 
+use crate::game2048::{self, Board, Move};
 use crate::keys::{Key, KeyDecoder};
 use crate::platform::System;
 use crate::shell::Shell;
@@ -29,6 +31,7 @@ pub static ACTIVE_TIMERS: AtomicU32 = AtomicU32::new(0);
 static NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1);
 static BEST_REACTION_MS: AtomicU32 = AtomicU32::new(u32::MAX);
 static BEST_SNAKE: AtomicU32 = AtomicU32::new(0);
+static BEST_2048: AtomicU32 = AtomicU32::new(0);
 
 /// Up to TIMER_SLOTS of these can exist at once. Their memory is reserved at compile time,
 /// so spawning one never allocates.
@@ -547,6 +550,110 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "\x1b[{};1H\x1b[?25h{outcome}  score {score}, length {}, best {best}{record}\r\n",
             snake::H as u32 + 4,
             game.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2048
+    // -----------------------------------------------------------------------
+
+    async fn draw_2048(&mut self, board: &Board, note: &str) {
+        // Background colour per exponent: warm for small tiles, hotter as they grow.
+        const COLORS: [u8; 12] = [0, 230, 223, 216, 209, 203, 197, 227, 221, 220, 214, 208];
+        let best = BEST_2048.load(Ordering::Relaxed).max(board.score);
+        out!(self.term, "\x1b[H\x1b[1;33m2048\x1b[0m   score {:<6} best {:<6} {note}\x1b[K\r\n", board.score, best);
+        let edge = |l: char, m: char, r: char| {
+            let mut s: String<128> = String::new();
+            let _ = s.push(l);
+            for c in 0..game2048::N {
+                for _ in 0..7 {
+                    let _ = s.push('\u{2500}');
+                }
+                let _ = s.push(if c + 1 < game2048::N { m } else { r });
+            }
+            s
+        };
+        out!(self.term, "{}\r\n", edge('\u{250c}', '\u{252c}', '\u{2510}').as_str());
+        for row in 0..game2048::N {
+            for sub in 0..3 {
+                let mut line: String<512> = String::new();
+                let _ = line.push('\u{2502}');
+                for col in 0..game2048::N {
+                    let exp = board.cells[row][col] as usize;
+                    if exp == 0 {
+                        let _ = line.push_str("       ");
+                    } else {
+                        let bg = COLORS[exp.min(COLORS.len() - 1)];
+                        let _ = write!(line, "\x1b[1;30;48;5;{bg}m");
+                        if sub == 1 {
+                            let _ = write!(line, "{:^7}", board.tile(row, col));
+                        } else {
+                            let _ = line.push_str("       ");
+                        }
+                        let _ = line.push_str("\x1b[0m");
+                    }
+                    let _ = line.push('\u{2502}');
+                }
+                let _ = line.push_str("\r\n");
+                self.term.print(&line).await;
+            }
+            if row + 1 < game2048::N {
+                out!(self.term, "{}\r\n", edge('\u{251c}', '\u{253c}', '\u{2524}').as_str());
+            }
+        }
+        out!(self.term, "{}\r\n", edge('\u{2514}', '\u{2534}', '\u{2518}').as_str());
+        self.term.flush().await;
+    }
+
+    pub(crate) async fn cmd_2048(&mut self) {
+        const KEYS: &str = "\x1b[2marrows/WASD/hjkl slide, q quits\x1b[0m";
+        let mut board = Board::new(|| self.sys.random_u32());
+        let mut keys = KeyDecoder::new();
+        let mut reached_2048 = false;
+        self.term.print("\x1b[2J\x1b[?25l").await;
+        self.draw_2048(&board, KEYS).await;
+
+        let mut buf = [0u8; 16];
+        let outcome = 'game: loop {
+            let n = match self.rx.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => {
+                    Timer::after_millis(50).await;
+                    continue;
+                }
+            };
+            for &b in &buf[..n] {
+                let m = match keys.feed(b) {
+                    Some(Key::Up | Key::Char(b'w' | b'W' | b'k')) => Move::Up,
+                    Some(Key::Down | Key::Char(b's' | b'S' | b'j')) => Move::Down,
+                    Some(Key::Left | Key::Char(b'a' | b'A' | b'h')) => Move::Left,
+                    Some(Key::Right | Key::Char(b'd' | b'D' | b'l')) => Move::Right,
+                    Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game "quit",
+                    _ => continue,
+                };
+                if !board.play(m, || self.sys.random_u32()) {
+                    continue;
+                }
+                let note = if board.best_tile() >= 2048 && !reached_2048 {
+                    reached_2048 = true;
+                    "\x1b[1;33myou made 2048!\x1b[0m keep going, or q to quit"
+                } else {
+                    KEYS
+                };
+                self.draw_2048(&board, note).await;
+                if board.is_stuck() {
+                    break 'game "\x1b[1;31mno moves left\x1b[0m";
+                }
+            }
+        };
+
+        let best = BEST_2048.fetch_max(board.score, Ordering::Relaxed).max(board.score);
+        let record = if board.score > 0 && board.score == best { "  \x1b[1;33mnew best!\x1b[0m" } else { "" };
+        out!(
+            self.term,
+            "\x1b[?25h{outcome}  score {}, biggest tile {}, best {best}{record}\r\n",
+            board.score,
+            board.best_tile()
         );
     }
 

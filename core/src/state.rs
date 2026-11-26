@@ -59,6 +59,43 @@ pub static EVENTS: Channel<CriticalSectionRawMutex, Event, 8> = Channel::new();
 pub static SAMPLE: Mutex<CriticalSectionRawMutex, Cell<Sample>> =
     Mutex::new(Cell::new(Sample { reading: Reading { temp_c: 0.0, vdda_mv: None }, count: 0 }));
 
+/// One temperature per second for the last `HISTORY_SECS` seconds, for the `graph` command.
+pub const HISTORY_SECS: usize = 60;
+
+pub struct TempHistory {
+    values: [f32; HISTORY_SECS],
+    /// Index the next value goes to.
+    next: usize,
+    len: usize,
+}
+
+impl TempHistory {
+    pub const fn new() -> Self {
+        Self { values: [0.0; HISTORY_SECS], next: 0, len: 0 }
+    }
+
+    pub fn push(&mut self, value: f32) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % HISTORY_SECS;
+        self.len = (self.len + 1).min(HISTORY_SECS);
+    }
+
+    /// The stored values, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = f32> + '_ {
+        let start = (self.next + HISTORY_SECS - self.len) % HISTORY_SECS;
+        (0..self.len).map(move |i| self.values[(start + i) % HISTORY_SECS])
+    }
+}
+
+impl Default for TempHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub static TEMP_HISTORY: Mutex<CriticalSectionRawMutex, RefCell<TempHistory>> =
+    Mutex::new(RefCell::new(TempHistory::new()));
+
 /// Temperature alert threshold in milli-degrees Celsius.
 pub static ALERT_MILLI_C: AtomicI32 = AtomicI32::new(32_000);
 pub static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
@@ -106,3 +143,21 @@ pub static STAT_BUTTON: TaskStat = TaskStat::new("button");
 pub static STAT_SENSOR: TaskStat = TaskStat::new("sensor");
 pub static STAT_WATCHDOG: TaskStat = TaskStat::new("watchdog");
 pub static STATS: [&TaskStat; 5] = [&STAT_SHELL, &STAT_LED, &STAT_BUTTON, &STAT_SENSOR, &STAT_WATCHDOG];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_keeps_the_latest_values_in_order() {
+        let mut h = TempHistory::new();
+        assert_eq!(h.iter().count(), 0);
+        for i in 0..HISTORY_SECS + 5 {
+            h.push(i as f32);
+        }
+        let values: heapless::Vec<f32, HISTORY_SECS> = h.iter().collect();
+        assert_eq!(values.len(), HISTORY_SECS);
+        assert_eq!(values[0], 5.0);
+        assert_eq!(values[HISTORY_SECS - 1], (HISTORY_SECS + 4) as f32);
+    }
+}

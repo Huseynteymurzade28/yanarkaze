@@ -12,11 +12,11 @@ use portable_atomic::Ordering;
 use crate::editor::{Editor, Out};
 use crate::platform::System;
 use crate::state::{
-    ALERT_MILLI_C, BUTTON_PRESSES, EVENTS, Event, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS, alert_limit_c,
-    current_led_mode, set_led_mode,
+    ALERT_MILLI_C, BUTTON_PRESSES, EVENTS, Event, HISTORY_SECS, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS,
+    TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
 };
 use crate::term::Term;
-use crate::{VERSION, fun};
+use crate::{VERSION, calc, fun};
 
 const PROMPT: &str = "\x1b[1;38;5;208myanarkaze\x1b[0m\x1b[1;38;5;51m>\x1b[0m ";
 
@@ -55,11 +55,15 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     cmd("top", "", "live task monitor with wakeups per second (any key stops)"),
     Command { completions: LED_MODES, ..cmd("led", "<mode>", "on | off | blink [ms] | heartbeat | morse <text>") },
     cmd("temp", "", "on-chip temperature (and supply voltage)"),
-    cmd("watch", "", "live temperature graph (press any key to stop)"),
+    cmd("watch", "", "live temperature bar (press any key to stop)"),
+    cmd("graph", "", "live chart of the last minute's temperature (any key stops)"),
     cmd("alert", "<celsius>", "set the temperature alert threshold"),
     cmd("uptime", "", "time since boot"),
     cmd("history", "", "list the previous command lines"),
     cmd("echo", "<text>", "print the text"),
+    cmd("calc", "<expr>", "calculator: 0xff & ~0x0f, 1 << 12, 7 / 2, (3 + 4) * 2"),
+    cmd("repeat", "<n> <cmd>", "run a command n times (any key stops)"),
+    cmd("every", "<s> <cmd>", "run a command every s seconds (any key stops)"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
     cmd("bootloader", "", "restart into the USB bootloader, ready for new firmware"),
@@ -77,6 +81,7 @@ pub(crate) const FUN_COMMANDS: &[Command] = &[
     cmd("life", "", "Conway's Game of Life"),
     cmd("matrix", "", "digital rain"),
     cmd("snake", "", "the classic, with arrow keys (the button pauses)"),
+    cmd("2048", "", "slide and merge tiles with the arrow keys"),
     cmd("dump", "<addr> [len]", "hex dump of real memory (dump with no args for examples)"),
     cmd("say", "<text>", "Ferris the crab says it"),
     cmd("fortune", "", "words of wisdom"),
@@ -104,6 +109,17 @@ pub(crate) fn find_command(name: &str) -> Option<&'static Command> {
 
 /// Tab completion: command names for the first word, the command's own list after it.
 pub(crate) fn complete(context: &str) -> &'static [&'static str] {
+    // Only the last command of a `a; b` chain matters, minus any `repeat 3` / `every 2`.
+    let mut context = context.rsplit(';').next().unwrap_or("");
+    loop {
+        let (first, rest) = split_word(context);
+        let (count, inner) = split_word(rest);
+        if matches!(first, "repeat" | "every") && !count.is_empty() && (!inner.is_empty() || rest.ends_with(' ')) {
+            context = inner;
+        } else {
+            break;
+        }
+    }
     let mut words = context.split_whitespace();
     match (words.next(), words.next()) {
         (None, _) => &COMMAND_NAMES,
@@ -111,6 +127,22 @@ pub(crate) fn complete(context: &str) -> &'static [&'static str] {
         (Some(name), None) => find_command(name).map_or(&[], |c| c.completions),
         _ => &[],
     }
+}
+
+/// Splits off the first word: `"led  on x"` -> `("led", "on x")`.
+pub(crate) fn split_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    match s.find(' ') {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+/// Which of the 8 block heights to draw for `value` in chart row `row` (0 = bottom) of a
+/// chart `rows` high spanning `lo..hi`.
+pub(crate) fn chart_level(value: f32, lo: f32, hi: f32, row: usize, rows: usize) -> usize {
+    let eighths = ((value - lo) / (hi - lo) * (rows * 8) as f32) as i32;
+    (eighths - row as i32 * 8).clamp(0, 8) as usize
 }
 
 const KEYS_HELP: &str = "Keys: Tab = complete, up/down = history, left/right/Home/End = move,\r\n      \
@@ -225,7 +257,46 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
+    /// Runs a command line: `;` separates commands, `repeat` and `every` wrap one.
     async fn run_command(&mut self, line: &str) {
+        for part in line.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let (first, rest) = split_word(part);
+            let (count, inner) = split_word(rest);
+            match first {
+                "repeat" => match count.parse::<u32>() {
+                    Ok(n @ 1..=1000) if Self::wrappable(inner) => {
+                        for i in 0..n {
+                            self.run_single(inner).await;
+                            if i + 1 < n && self.key_or_timeout(1).await {
+                                out!(self.term, "stopped after {} of {n}\r\n", i + 1);
+                                break;
+                            }
+                        }
+                    }
+                    _ => self.term.print("usage: repeat <1..1000> <command>\r\n").await,
+                },
+                "every" => match count.parse::<f32>() {
+                    Ok(s) if (0.1..=3600.0).contains(&s) && Self::wrappable(inner) => loop {
+                        self.run_single(inner).await;
+                        self.term.flush().await;
+                        if self.key_or_timeout((s * 1000.0) as u64).await {
+                            break;
+                        }
+                    },
+                    _ => self.term.print("usage: every <0.1..3600 seconds> <command>\r\n").await,
+                },
+                _ => self.run_single(part).await,
+            }
+        }
+    }
+
+    /// `repeat` and `every` take one plain command (nesting them would need async recursion).
+    fn wrappable(cmd: &str) -> bool {
+        !cmd.is_empty() && !matches!(split_word(cmd).0, "repeat" | "every")
+    }
+
+    async fn run_single(&mut self, line: &str) {
+        let rest = split_word(line).1;
         let mut args = line.split_whitespace();
         let Some(cmd) = args.next() else { return };
 
@@ -259,6 +330,10 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 out!(self.term, "samples     : {}\r\n", sample.count);
             }
             "watch" => self.cmd_watch().await,
+            "graph" => self.cmd_graph().await,
+            "calc" => self.cmd_calc(rest).await,
+            // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.
+            "repeat" | "every" => self.term.print("repeat and every cannot be nested\r\n").await,
             "alert" => match args.next().and_then(|v| v.parse::<f32>().ok()) {
                 Some(c) => {
                     ALERT_MILLI_C.store((c * 1000.0) as i32, Ordering::Relaxed);
@@ -300,6 +375,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "life" => self.cmd_life().await,
             "matrix" => self.cmd_matrix().await,
             "snake" => self.cmd_snake().await,
+            "2048" => self.cmd_2048().await,
             "dump" => self.cmd_dump(args).await,
             "say" => fun::say(&mut self.term, args).await,
             "fortune" => self.cmd_fortune().await,
@@ -477,6 +553,96 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         set_led_mode(mode);
     }
 
+    async fn cmd_calc(&mut self, expr: &str) {
+        if expr.is_empty() {
+            self.term.print("usage: calc <expression>, e.g. calc 0x1F << 4 | 3\r\n").await;
+            return;
+        }
+        match calc::eval(expr) {
+            Ok(calc::Value::Int(i)) => {
+                out!(self.term, "= {i}  ({i:#x}");
+                if (0..=0xFFFF_FFFF).contains(&i) {
+                    out!(self.term, ", {i:#b}");
+                }
+                self.term.print(")\r\n").await;
+            }
+            Ok(calc::Value::Float(f)) => out!(self.term, "= {f}\r\n"),
+            Err(e) => {
+                out!(self.term, "error: {e}\r\n");
+                if let calc::Error::Syntax(at) = e {
+                    // Echo the expression and point at the problem.
+                    out!(self.term, "  {expr}\r\n  {:>w$}\r\n", "^", w = at + 1);
+                }
+            }
+        }
+    }
+
+    async fn cmd_graph(&mut self) {
+        const ROWS: usize = 10;
+        const BLOCKS: [char; 9] =
+            [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+        self.term.print("\x1b[2J\x1b[?25l").await;
+        loop {
+            let data: heapless::Vec<f32, HISTORY_SECS> = TEMP_HISTORY.lock(|h| h.borrow().iter().collect());
+            let limit = alert_limit_c();
+            self.term.print("\x1b[H").await;
+            let Some(&now) = data.last() else {
+                self.term.print("collecting samples...\x1b[K\r\n").await;
+                if self.key_or_timeout(500).await {
+                    break;
+                }
+                continue;
+            };
+            let (mut lo, mut hi) = data.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+            out!(
+                self.term,
+                "\x1b[1mtemperature\x1b[0m, last {} s   now {now:.2} C   min {lo:.2}   max {hi:.2}   alert {limit:.1}\x1b[K\r\n\r\n",
+                data.len()
+            );
+            // At least one degree of range, so sensor noise does not fill the whole chart.
+            if hi - lo < 1.0 {
+                let mid = (hi + lo) / 2.0;
+                (lo, hi) = (mid - 0.5, mid + 0.5);
+            }
+            for row in (0..ROWS).rev() {
+                let mut line: String<512> = String::new();
+                let label = lo + (hi - lo) * (row + 1) as f32 / ROWS as f32;
+                let _ = write!(line, "{label:7.2} \u{2502}");
+                // Right-align, so the newest point is always under "now".
+                for _ in data.len()..HISTORY_SECS {
+                    let _ = line.push(' ');
+                }
+                let mut red = false;
+                for &v in &data {
+                    let hot = v > limit;
+                    if hot != red {
+                        let _ = line.push_str(if hot { "\x1b[31m" } else { "\x1b[36m" });
+                        red = hot;
+                    } else if line.ends_with('\u{2502}') {
+                        let _ = line.push_str("\x1b[36m");
+                    }
+                    let _ = line.push(BLOCKS[chart_level(v, lo, hi, row, ROWS)]);
+                }
+                let _ = line.push_str("\x1b[0m\x1b[K\r\n");
+                self.term.print(&line).await;
+            }
+            let mut axis: String<256> = String::new();
+            let _ = axis.push_str("        \u{2514}");
+            for _ in 0..HISTORY_SECS {
+                let _ = axis.push('\u{2500}');
+            }
+            // Printed in two parts: the box-drawing axis alone nearly fills out!'s buffer.
+            self.term.print(&axis).await;
+            out!(self.term, "\r\n         -{HISTORY_SECS}s{:>w$}\x1b[K\r\n", "now", w = HISTORY_SECS - 3);
+            out!(self.term, "\r\n\x1b[2mone point per second, any key stops\x1b[0m\x1b[K");
+            self.term.flush().await;
+            if self.key_or_timeout(1000).await {
+                break;
+            }
+        }
+        self.term.print("\x1b[?25h\r\n").await;
+    }
+
     async fn cmd_watch(&mut self) {
         self.term.print("live temperature - press any key to stop\r\n").await;
         loop {
@@ -515,9 +681,15 @@ mod tests {
     fn every_listed_command_is_dispatched() {
         // Cheap guard against adding a table entry but forgetting the `match` arm.
         let source = include_str!("shell.rs");
-        let dispatch = &source[source.find("match cmd {").unwrap()..];
+        let dispatch = &source[source.find("async fn run_single").unwrap()..];
         for name in COMMAND_NAMES {
-            assert!(dispatch.contains(&format!("\"{name}\" =>")), "'{name}' is not handled by run_command");
+            let arm = format!("\"{name}\" =>");
+            let first_of_several = format!("\"{name}\" |");
+            let last_of_several = format!("| \"{name}\" =>");
+            assert!(
+                [arm, first_of_several, last_of_several].iter().any(|p| dispatch.contains(p.as_str())),
+                "'{name}' is not handled by run_single"
+            );
         }
     }
 
@@ -529,11 +701,34 @@ mod tests {
     }
 
     #[test]
+    fn splitting_words() {
+        assert_eq!(split_word("  led  on x"), ("led", "on x"));
+        assert_eq!(split_word("ps"), ("ps", ""));
+        assert_eq!(split_word(""), ("", ""));
+    }
+
+    #[test]
+    fn chart_levels() {
+        // A 2-row chart from 0 to 2: 1.0 fills the bottom row and leaves the top empty.
+        assert_eq!(chart_level(1.0, 0.0, 2.0, 0, 2), 8);
+        assert_eq!(chart_level(1.0, 0.0, 2.0, 1, 2), 0);
+        assert_eq!(chart_level(1.5, 0.0, 2.0, 1, 2), 4);
+        assert_eq!(chart_level(-5.0, 0.0, 2.0, 0, 2), 0);
+        assert_eq!(chart_level(9.0, 0.0, 2.0, 1, 2), 8);
+    }
+
+    #[test]
     fn completion_contexts() {
         assert_eq!(complete("").len(), COMMAND_NAMES.len());
         assert_eq!(complete("help ").len(), COMMAND_NAMES.len());
         assert_eq!(complete("led "), LED_MODES);
         assert!(complete("led blink ").is_empty());
         assert!(complete("nope ").is_empty());
+        // After `;` and inside repeat / every, completion starts over with a command.
+        assert_eq!(complete("temp; ").len(), COMMAND_NAMES.len());
+        assert_eq!(complete("repeat 3 ").len(), COMMAND_NAMES.len());
+        assert_eq!(complete("every 2 led "), LED_MODES);
+        assert_eq!(complete("ps; repeat 3 led "), LED_MODES);
+        assert!(complete("repeat ").is_empty()); // the count comes first
     }
 }
