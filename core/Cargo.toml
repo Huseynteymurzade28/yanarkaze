@@ -1,0 +1,27 @@
+[package]
+name = "yanarkaze-core"
+description = "Portable core of yanarkaze: shell, tasks and commands, independent of any board"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+embassy-executor = "0.10"
+embassy-futures = "0.1"
+embassy-sync = "0.8"
+embassy-time = "0.5"
+embedded-io-async = "0.7"
+heapless = "0.9"
+portable-atomic = "1"
+
+[features]
+default = ["atomics-via-critical-section"]
+# Some targets (Cortex-M0+, RISC-V without the A extension) lack atomic read-modify-write;
+# portable-atomic then falls back to critical sections (native atomics are used elsewhere).
+# Turn this off if your HAL already configures portable-atomic (esp-hal does).
+atomics-via-critical-section = ["portable-atomic/critical-section"]
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+embassy-time = { version = "0.5", features = ["std"] }

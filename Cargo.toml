@@ -1,26 +1,14 @@
-[package]
-name = "nucleos"
+# Host-side workspace: the portable core and the desktop simulator.
+#
+# The embedded boards are standalone crates (each with its own target, linker setup and
+# Cargo.lock), so they are excluded here. Build them from their own directory:
+#   cd boards/nucleo-l452re && cargo run --release
+[workspace]
+resolver = "3"
+members = ["core", "boards/sim"]
+exclude = ["boards/nucleo-l452re", "boards/rp-pico", "boards/nrf52840-dk", "boards/esp32c3"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-default-run = "nucleos"
-description = "A tiny async operating system for the NUCLEO-L452RE, built on Embassy"
-repository = "https://github.com/Huseynteymurzade28/nucleos"
-readme = "README.md"
-
-[dependencies]
-cortex-m = { version = "0.7.10", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7.7"
-defmt = "1.2.0"
-defmt-rtt = "1.3.1"
-embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-futures = "0.1"
-embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32l452re", "time-driver-any", "memory-x", "exti", "unstable-pac"] }
-embassy-sync = "0.8"
-embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
-embedded-io-async = "0.7"
-heapless = "0.9.4"
-panic-probe = { version = "1.0.0", features = ["print-defmt"] }
-static_cell = "2.1.1"
-
-[profile.release]
-debug = 2
+repository = "https://github.com/Huseynteymurzade28/yanarkaze"

@@ -1,0 +1,22 @@
+[package]
+name = "yanarkaze-esp32c3"
+description = "yanarkaze on the ESP32-C3 (RISC-V, built-in USB serial/JTAG)"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/Huseynteymurzade28/yanarkaze"
+
+[dependencies]
+# esp-hal already sets up portable-atomic for the single-core C3.
+yanarkaze-core = { path = "../../core", default-features = false }
+embassy-executor = "0.10.0"
+embassy-time = "0.5.1"
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
+esp-hal = { version = "1.2.3", features = ["esp32c3", "unstable"] }
+esp-rtos = { version = "0.4.0", features = ["esp32c3", "embassy"] }
+heapless = "0.9.4"
+static_cell = "2.1.1"
+
+[profile.release]
+debug = 2
+opt-level = "s"
+lto = "fat"

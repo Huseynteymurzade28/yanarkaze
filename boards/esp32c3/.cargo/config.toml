@@ -1,0 +1,8 @@
+[target.riscv32imc-unknown-none-elf]
+# Needs espflash: cargo install espflash --locked
+runner = "espflash flash --monitor"
+rustflags = ["-C", "link-arg=-Tlinkall.x", "-C", "force-frame-pointers"]
+
+[build]
+target = "riscv32imc-unknown-none-elf"
+

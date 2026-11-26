@@ -1,99 +1,179 @@
-# NucleOS
-
-A tiny async "operating system" for the **NUCLEO-L452RE** (STM32L452, Cortex-M4F @ 80 MHz),
-written in Rust on top of the [Embassy](https://embassy.dev) async executor.
-
-Instead of threads with their own stacks, every subsystem is an `async` task. The CPU sleeps
-whenever all tasks are waiting, and interrupts (timer, EXTI, DMA) wake exactly the task
-that needs to run.
+# yanarkaze
 
 ```
-  _   _            _       ___  ____
- | \ | |_   _  ___| | ___ / _ \/ ___|
- |  \| | | | |/ __| |/ _ \ | | \___ \
- | |\  | |_| | (__| |  __/ |_| |___) |
- |_| \_|\__,_|\___|_|\___|\___/|____/
+                              _
+ _  _  __ _  _ _   __ _  _ _ | |__ __ _  ___  ___
+| || |/ _` || ' \ / _` || '_|| / // _` ||_ / / -_)
+ \_, |\__,_||_||_|\__,_||_|  |_\_\\__,_|/__| \___|
+ |__/
 ```
 
-## Tasks
+**yanar** (Azerbaijani: *burning*, as in [Yanardag](https://en.wikipedia.org/wiki/Yanar_Dag), the
+mountain that has been on fire for millennia) + **kaze** (Japanese 風: *wind*).
 
-| Task       | What it does                                                              | Woken by            |
-|------------|---------------------------------------------------------------------------|---------------------|
-| `shell`    | Interactive command line on the ST-LINK virtual COM port                  | UART RX DMA, events |
-| `led`      | LED patterns: blink, heartbeat, morse code                                | timer, mode signal  |
-| `button`   | Blue USER button, debounced, cycles LED modes                             | EXTI interrupt      |
-| `sensor`   | On-chip temperature sensor + VDDA via VREFINT, raises threshold alerts    | timer               |
-| `watchdog` | Feeds the independent watchdog (IWDG, 2 s timeout)                        | timer               |
+A tiny async operating system written in Rust on top of the [Embassy](https://embassy.dev)
+executor. It keeps burning on whatever board the wind carries it to: the same shell, tasks and
+commands run on an STM32, an RP2040, an nRF52840, an ESP32-C3, and even in your desktop terminal.
 
-Tasks communicate through `embassy-sync` primitives:
+## Platforms
 
-- `Signal<LedMode>`: shell/button -> led (latest value wins, the pattern switches instantly)
-- `Channel<Event, 8>`: button/sensor -> shell (button presses, temperature alerts)
-- `blocking_mutex::Mutex`: shared sensor readings and state for `ps`
+| Board                    | Chip / core                    | Console                 | Status                   |
+|--------------------------|--------------------------------|-------------------------|--------------------------|
+| Desktop simulator        | your PC (Linux, macOS, Windows)| the terminal            | tested                   |
+| ST NUCLEO-L452RE         | STM32L452, Cortex-M4F 80 MHz   | ST-LINK VCP (USART2)    | tested on hardware       |
+| Raspberry Pi Pico        | RP2040, Cortex-M0+ 125 MHz     | native USB (CDC-ACM)    | builds, awaiting testing |
+| Nordic nRF52840-DK       | nRF52840, Cortex-M4F 64 MHz    | J-Link VCP (UARTE0)     | builds, untested         |
+| ESP32-C3                 | RISC-V RV32IMC 160 MHz         | built-in USB Serial/JTAG| builds, untested         |
+
+## Architecture
+
+```
+core/                    yanarkaze-core: no_std, no hardware
+  platform.rs            the traits a board implements: Led, Button, Sensor, Watchdog, System
+  shell.rs               line editing, history, built-in commands
+  fun.rs                 reaction game, dice, timers, mandelbrot, life, matrix, dump, ferris
+  led.rs button.rs       task logic, generic over the traits
+  sensor.rs watchdog.rs
+  state.rs               shared state: Signal, Channel, Mutex, task statistics
+boards/
+  sim/                   std: raw-mode terminal, threads stand in for hardware
+  nucleo-l452re/         embassy-stm32
+  rp-pico/               embassy-rp + embassy-usb
+  nrf52840-dk/           embassy-nrf
+  esp32c3/               esp-hal + esp-rtos
+```
+
+The core never touches a register. A board crate implements five small traits and spawns
+thin `#[embassy_executor::task]` wrappers around the core task functions:
+
+```rust
+#[embassy_executor::task]
+async fn led_task(led: PicoLed) {
+    yanarkaze_core::led::run(led).await
+}
+```
+
+Porting to a new board is usually 200 to 300 lines: pick a console (anything implementing
+`embedded_io_async::Read + Write`), an LED, a button, a temperature source and a watchdog.
+
+### Tasks
+
+| Task        | What it does                                           |
+|-------------|--------------------------------------------------------|
+| `shell`     | interactive command line                               |
+| `led`       | LED patterns: blink, heartbeat, morse code             |
+| `button`    | debounced button, cycles LED modes or feeds the game   |
+| `sensor`    | samples the die temperature, raises threshold alerts   |
+| `watchdog`  | feeds the hardware watchdog (2 s timeout)              |
+| `countdown` | up to 4 spawned at runtime by the `timer` command      |
+
+They talk through `embassy-sync` primitives: a `Signal` for the LED mode, a `Channel` of events
+that the shell prints asynchronously, and mutex-protected shared readings.
 
 ## Shell commands
 
 ```
-help                 show this help
-info                 chip, clock, uptime and reset reason
-ps                   list running tasks and their wakeups
-led <mode>           on | off | blink [ms] | heartbeat | morse <text>
-temp                 on-chip temperature and supply voltage
-watch                live temperature graph (press any key to stop)
-alert <celsius>      set the temperature alert threshold
-uptime               time since boot
-hang                 freeze the executor -> watchdog resets the chip
-reboot               software reset
-clear                clear the screen
+System:
+  help                 show this help
+  info                 board, chip, clock, uptime and reset reason
+  ps                   list running tasks and their wakeups
+  led <mode>           on | off | blink [ms] | heartbeat | morse <text>
+  temp                 on-chip temperature (and supply voltage)
+  watch                live temperature graph (press any key to stop)
+  alert <celsius>      set the temperature alert threshold
+  uptime               time since boot
+  hang                 freeze the executor -> watchdog resets the system
+  reboot               restart
+  clear                clear the screen
+
+Fun:
+  reaction             reflex game: hit the button when the LED turns on
+  roll [N]dM           roll dice with the RNG (roll 2d6, roll d20)
+  timer <s> [label]    spawn a new countdown task at runtime
+  mandel               Mandelbrot set, timed in CPU cycles
+  life                 Conway's Game of Life
+  matrix               digital rain
+  dump <addr> [len]    hex dump of real memory (dump with no args for examples)
+  say <text>           Ferris the crab says it
+  fortune              words of wisdom
 ```
 
-### Fun commands
+Up/down arrows browse the history, Ctrl+C cancels the current line.
 
-Each one shows off a different part of the chip or the runtime (`src/fun.rs`):
+## Running it
 
+### Desktop simulator (no hardware)
+
+```sh
+cargo run -p yanarkaze-sim
 ```
-reaction             reflex game: hit the button when the LED turns on   (EXTI timestamps)
-roll [N]dM           roll dice, e.g. roll 2d6, roll d20                   (hardware TRNG)
-timer <s> [label]    spawn a new countdown task at runtime                (task pool, pool_size = 4)
-mandel               Mandelbrot set, timed in CPU cycles                  (FPU + DWT cycle counter)
-life                 Conway's Game of Life seeded from the TRNG
-matrix               digital rain
-dump <addr> [len]    hex dump of flash, SRAM or factory data              (try: dump 0x1FFF7590 12)
-say <text>           Ferris the crab says it
-fortune              words of wisdom
+
+Ctrl+B presses the button, Ctrl+T puts your finger on the chip (the simulated temperature
+rises, try `alert 30` first), Ctrl+D quits. The LED blinks in the terminal's title bar, and
+`hang` really freezes the executor: a watchdog thread restarts the process.
+
+### NUCLEO-L452RE
+
+Requires [probe-rs](https://probe.rs) (`cargo install probe-rs-tools --locked`).
+
+```sh
+cd boards/nucleo-l452re
+cargo run --release              # flash and stream defmt logs
+picocom -b 115200 /dev/ttyACM0   # in a second terminal: the shell
+```
+
+### Raspberry Pi Pico
+
+Requires [picotool](https://github.com/raspberrypi/picotool). Hold BOOTSEL while plugging the
+Pico in, then:
+
+```sh
+cd boards/rp-pico
+cargo run --release              # flashes over USB and reboots
+picocom /dev/ttyACM0             # the Pico shows up as a USB serial port
+```
+
+The Pico has no user button, so BOOTSEL doubles as the button once the firmware runs.
+
+### nRF52840-DK
+
+```sh
+cd boards/nrf52840-dk
+cargo run --release              # probe-rs through the on-board J-Link
+picocom -b 115200 /dev/ttyACM0
+```
+
+### ESP32-C3
+
+Requires `rustup target add riscv32imc-unknown-none-elf` and
+[espflash](https://github.com/esp-rs/espflash) (`cargo install espflash --locked`).
+
+```sh
+cd boards/esp32c3
+cargo run --release              # flashes and opens the serial monitor
+```
+
+The LED pin (GPIO8, active low) matches the common "SuperMini" boards; change `EspLed` in
+`boards/esp32c3/src/main.rs` for other boards.
+
+## Tests
+
+```sh
+cargo test -p yanarkaze-core
 ```
 
 ## Demo ideas
 
 1. `led morse HELLO` and keep typing commands while the LED blinks: tasks run concurrently.
 2. `alert 30`, then put your finger on the MCU: an `[alert]` event pops up in the shell.
-3. `watch` for a live temperature bar graph.
-4. `hang` blocks the cooperative executor with a busy loop. Nobody feeds the watchdog,
-   the chip resets after 2 s and the banner reports `last reset: watchdog (IWDG)`.
-5. `ps` before and after pressing the button to see the wakeup counters grow.
-6. `timer 5 tea`, `timer 8 coffee`, then `ps`: new tasks were spawned while the system runs.
-7. `dump 0x1FFF7590 12` shows the chip's unique ID straight from factory memory; compare with `info`.
-
-## Build and flash
-
-Requirements: Rust with the `thumbv7em-none-eabihf` target and
-[probe-rs](https://probe.rs) (`cargo install probe-rs-tools --locked`).
-
-```sh
-cargo run --release              # flash NucleOS and stream defmt logs over RTT
-cargo run --release --bin blinky # the minimal blinky example
-```
-
-Connect to the shell (115200 8N1) with any serial terminal, for example:
-
-```sh
-picocom -b 115200 /dev/ttyACM0   # or: tio /dev/ttyACM0
-```
+3. `timer 5 tea`, `timer 8 coffee`, then `ps`: new tasks spawned while the system runs.
+4. `mandel` on the Nucleo and on the Pico: hardware FPU vs. software floats.
+5. `hang` blocks the cooperative executor. Nobody feeds the watchdog, the system resets and
+   the banner reports why.
 
 ## Notes
 
-- The user LED is LD2 on PA5 (NUCLEO-L452RE) or LD4 on PB13 (NUCLEO-L452RE-P); both are driven.
-- `stm32-metapac` 21.0 swaps the `CH17SEL`/`CH18SEL` bits of `ADC_CCR` for STM32L4.
-  Per RM0394 the temperature sensor is bit 23, so `sensor_task` sets it by hand.
-- The shell UART uses DMA for TX and a circular DMA buffer for RX, so no input bytes are lost
-  while a command is running.
+- `stm32-metapac` 21.0 swaps the `CH17SEL`/`CH18SEL` bits of `ADC_CCR` for STM32L4. Per RM0394
+  the temperature sensor is bit 23, so the Nucleo board sets it by hand.
+- The Nucleo console uses DMA for TX and a circular DMA buffer for RX, so no input bytes are
+  lost while a command is running.

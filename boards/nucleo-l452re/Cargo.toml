@@ -1,0 +1,23 @@
+[package]
+name = "yanarkaze-nucleo-l452re"
+description = "yanarkaze on the ST NUCLEO-L452RE (STM32L452, Cortex-M4F)"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/Huseynteymurzade28/yanarkaze"
+default-run = "yanarkaze-nucleo-l452re"
+
+[dependencies]
+yanarkaze-core = { path = "../../core" }
+cortex-m = { version = "0.7.10", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.7"
+defmt = "1.2.0"
+defmt-rtt = "1.3.1"
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32l452re", "time-driver-any", "memory-x", "exti", "unstable-pac"] }
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+heapless = "0.9.4"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+static_cell = "2.1.1"
+
+[profile.release]
+debug = 2

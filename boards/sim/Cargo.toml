@@ -1,0 +1,20 @@
+[package]
+name = "yanarkaze-sim"
+description = "yanarkaze running in your desktop terminal, no hardware needed"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "yanarkaze-sim"
+path = "src/main.rs"
+
+[dependencies]
+yanarkaze-core = { path = "../../core" }
+critical-section = { version = "1", features = ["std"] }
+crossterm = "0.29"
+embassy-executor = { version = "0.10", features = ["platform-std", "executor-thread"] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["std"] }
+embedded-io-async = "0.7"
+heapless = "0.9"
