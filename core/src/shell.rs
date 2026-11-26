@@ -70,6 +70,21 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     cmd("clear", "", "clear the screen"),
 ];
 
+const GPIO_ACTIONS: &[&str] = &["on", "off", "toggle", "read"];
+
+pub(crate) const HW_COMMANDS: &[Command] = &[
+    cmd("pins", "", "which pins can do what on this board"),
+    cmd("gpio", "<pin> <action>", "on | off | toggle | read [up|down]   e.g. gpio 16 on"),
+    cmd("pwm", "<pin> <%> [hz]", "PWM output, e.g. LED brightness: pwm 16 25   (pwm 16 off)"),
+    cmd("fade", "<pin> [ms]", "make an LED breathe (any key stops)"),
+    cmd("adc", "<pin> [watch]", "read an analog pin in millivolts, e.g. a potentiometer"),
+    cmd("knob", "<adc> <pwm>", "a potentiometer dims an LED, live: knob 26 16"),
+    Command {
+        completions: &["scan", "read", "write"],
+        ..cmd("i2c", "scan|read|write", "find I2C devices, read or write registers")
+    },
+];
+
 pub(crate) const FUN_COMMANDS: &[Command] = &[
     cmd("reaction", "", "reflex game: hit the button when the LED turns on"),
     Command {
@@ -88,23 +103,36 @@ pub(crate) const FUN_COMMANDS: &[Command] = &[
 ];
 
 /// Names of every command, in help order (for tab completion of the first word).
-const COMMAND_NAMES: [&str; SYSTEM_COMMANDS.len() + FUN_COMMANDS.len()] = {
-    let mut names = [""; SYSTEM_COMMANDS.len() + FUN_COMMANDS.len()];
-    let mut i = 0;
-    while i < SYSTEM_COMMANDS.len() {
-        names[i] = SYSTEM_COMMANDS[i].name;
-        i += 1;
-    }
-    let mut j = 0;
-    while j < FUN_COMMANDS.len() {
-        names[i + j] = FUN_COMMANDS[j].name;
-        j += 1;
+/// Every command table, in help order.
+const SECTIONS: [(&str, &[Command]); 3] =
+    [("System:", SYSTEM_COMMANDS), ("Hardware:", HW_COMMANDS), ("Fun:", FUN_COMMANDS)];
+
+const COMMAND_COUNT: usize = SYSTEM_COMMANDS.len() + HW_COMMANDS.len() + FUN_COMMANDS.len();
+
+/// Names of every command, in help order (for tab completion of the first word).
+const COMMAND_NAMES: [&str; COMMAND_COUNT] = {
+    let mut names = [""; COMMAND_COUNT];
+    let mut n = 0;
+    let mut s = 0;
+    while s < SECTIONS.len() {
+        let table = SECTIONS[s].1;
+        let mut i = 0;
+        while i < table.len() {
+            names[n] = table[i].name;
+            n += 1;
+            i += 1;
+        }
+        s += 1;
     }
     names
 };
 
+fn all_commands() -> impl Iterator<Item = &'static Command> {
+    SECTIONS.iter().flat_map(|(_, table)| table.iter())
+}
+
 pub(crate) fn find_command(name: &str) -> Option<&'static Command> {
-    SYSTEM_COMMANDS.iter().chain(FUN_COMMANDS).find(|c| c.name == name)
+    all_commands().find(|c| c.name == name)
 }
 
 /// Tab completion: command names for the first word, the command's own list after it.
@@ -125,6 +153,7 @@ pub(crate) fn complete(context: &str) -> &'static [&'static str] {
         (None, _) => &COMMAND_NAMES,
         (Some("help"), None) => &COMMAND_NAMES,
         (Some(name), None) => find_command(name).map_or(&[], |c| c.completions),
+        (Some("gpio"), Some(_pin)) if words.next().is_none() => GPIO_ACTIONS,
         _ => &[],
     }
 }
@@ -155,6 +184,8 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) term: Term<W>,
     pub(crate) spawner: Spawner,
     editor: Editor,
+    /// Last level written to each pin by `gpio`, for `gpio <pin> toggle`.
+    pub(crate) gpio_levels: u64,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -162,7 +193,8 @@ pub struct Shell<S: System, R: Read, W: Write> {
 /// `rx` must be cancel-safe: dropping a pending `read` must not lose bytes (ring buffers,
 /// pipes and buffered UARTs are fine).
 pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Spawner) -> ! {
-    let mut shell = Shell { sys, rx, term: Term::new(tx), spawner, editor: Editor::new(PROMPT, complete) };
+    let mut shell =
+        Shell { sys, rx, term: Term::new(tx), spawner, editor: Editor::new(PROMPT, complete), gpio_levels: 0 };
     shell.main_loop().await
 }
 
@@ -331,6 +363,13 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
             "watch" => self.cmd_watch().await,
             "graph" => self.cmd_graph().await,
+            "pins" => self.cmd_pins().await,
+            "gpio" => self.cmd_gpio(args).await,
+            "pwm" => self.cmd_pwm(args).await,
+            "fade" => self.cmd_fade(args).await,
+            "adc" => self.cmd_adc(args).await,
+            "knob" => self.cmd_knob(args).await,
+            "i2c" => self.cmd_i2c(args).await,
             "calc" => self.cmd_calc(rest).await,
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.
             "repeat" | "every" => self.term.print("repeat and every cannot be nested\r\n").await,
@@ -391,7 +430,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
             return;
         }
-        for (title, commands) in [("System:", SYSTEM_COMMANDS), ("Fun:", FUN_COMMANDS)] {
+        for (title, commands) in SECTIONS {
             out!(self.term, "{title}\r\n");
             for c in commands {
                 self.print_usage(c).await;
@@ -695,7 +734,7 @@ mod tests {
 
     #[test]
     fn usage_fits_the_help_column() {
-        for c in SYSTEM_COMMANDS.iter().chain(FUN_COMMANDS) {
+        for c in all_commands() {
             assert!(c.name.len() + 1 + c.args.len() <= 20, "usage of '{}' is too long", c.name);
         }
     }
@@ -728,6 +767,8 @@ mod tests {
         assert_eq!(complete("temp; ").len(), COMMAND_NAMES.len());
         assert_eq!(complete("repeat 3 ").len(), COMMAND_NAMES.len());
         assert_eq!(complete("every 2 led "), LED_MODES);
+        assert_eq!(complete("gpio 16 "), GPIO_ACTIONS);
+        assert!(complete("gpio 16 read ").is_empty());
         assert_eq!(complete("ps; repeat 3 led "), LED_MODES);
         assert!(complete("repeat ").is_empty()); // the count comes first
     }

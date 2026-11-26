@@ -1666,6 +1666,7 @@ dependencies = [
  "cortex-m-rt",
  "embassy-executor",
  "embassy-rp",
+ "embassy-sync",
  "embassy-time",
  "embassy-usb",
  "embedded-io-async 0.7.0",

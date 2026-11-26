@@ -18,7 +18,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
 use heapless::String;
-use yanarkaze_core::{BoardInfo, Button, Led, MemRegion, Reading, Sensor, System, Watchdog};
+use yanarkaze_core::{BoardInfo, Button, HwError, Led, MemRegion, PinInfo, Pull, Reading, Sensor, System, Watchdog};
 
 const RESET_REASON_ENV: &str = "YANARKAZE_RESET_REASON";
 const WATCHDOG_TIMEOUT_MS: u64 = 2000;
@@ -224,6 +224,34 @@ struct SimSystem {
     reset_reason: &'static str,
     rng: XorShift,
     regions: [MemRegion; 1],
+    /// Output levels of the simulated pins (bit n = GPn).
+    levels: u32,
+}
+
+/// Pretend header: GP0-15 for gpio / pwm, GP26-28 analog.
+static SIM_PINS: [PinInfo; 19] = {
+    let mut pins = [PinInfo { pin: 0, gpio: true, pwm: true, adc: false, note: "simulated" }; 19];
+    let mut i = 0;
+    while i < 19 {
+        if i < 16 {
+            pins[i].pin = i as u8;
+        } else {
+            pins[i] = PinInfo { pin: 10 + i as u8, gpio: false, pwm: false, adc: true, note: "simulated knob" };
+        }
+        i += 1;
+    }
+    pins
+};
+
+/// Fake I2C devices so `i2c scan` finds something: an OLED and a BME280 (chip ID 0x60).
+const SIM_I2C: [u8; 2] = [0x3C, 0x76];
+
+fn sim_pin(pin: u8, what: fn(&PinInfo) -> bool) -> Result<(), HwError> {
+    match SIM_PINS.iter().find(|p| p.pin == pin) {
+        Some(p) if what(p) => Ok(()),
+        Some(_) => Err(HwError::WrongPin),
+        None => Err(HwError::NoSuchPin),
+    }
 }
 
 impl SimSystem {
@@ -250,6 +278,7 @@ impl SimSystem {
             reset_reason,
             rng: XorShift::from_time(),
             regions: [MemRegion { start: rom, end: rom + SIM_ROM.len(), name: "simulated ROM" }],
+            levels: 0,
         }
     }
 }
@@ -279,6 +308,70 @@ impl System for SimSystem {
 
     fn reset(&mut self) -> ! {
         restart("software reset");
+    }
+
+    fn pins(&self) -> &[PinInfo] {
+        &SIM_PINS
+    }
+
+    fn gpio_write(&mut self, pin: u8, high: bool) -> Result<(), HwError> {
+        sim_pin(pin, |p| p.gpio)?;
+        if high {
+            self.levels |= 1 << pin;
+        } else {
+            self.levels &= !(1 << pin);
+        }
+        Ok(())
+    }
+
+    /// Inputs read back what was last written, or the pull when nothing was.
+    fn gpio_read(&mut self, pin: u8, pull: Pull) -> Result<bool, HwError> {
+        sim_pin(pin, |p| p.gpio)?;
+        Ok(match pull {
+            Pull::Up => true,
+            Pull::Down => false,
+            Pull::None => self.levels & (1 << pin) != 0,
+        })
+    }
+
+    fn pwm_set(&mut self, pin: u8, freq_hz: u32, duty: u16) -> Result<u32, HwError> {
+        sim_pin(pin, |p| p.pwm)?;
+        if !(10..=1_000_000).contains(&freq_hz) || duty > 1000 {
+            return Err(HwError::OutOfRange);
+        }
+        Ok(freq_hz)
+    }
+
+    /// A knob that someone keeps turning slowly back and forth (a 6 s triangle wave).
+    async fn adc_read(&mut self, pin: u8) -> Result<u32, HwError> {
+        sim_pin(pin, |p| p.adc)?;
+        let phase = (embassy_time::Instant::now().as_millis() + pin as u64 * 1000) % 6000;
+        let up = if phase < 3000 { phase } else { 6000 - phase };
+        Ok((up * 3300 / 3000) as u32)
+    }
+
+    fn i2c_pins(&self) -> Option<&'static str> {
+        Some("simulated bus with an OLED at 0x3c and a BME280 at 0x76")
+    }
+
+    async fn i2c_write(&mut self, addr: u8, _bytes: &[u8]) -> Result<(), HwError> {
+        if SIM_I2C.contains(&addr) { Ok(()) } else { Err(HwError::Nack) }
+    }
+
+    async fn i2c_read(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), HwError> {
+        if !SIM_I2C.contains(&addr) {
+            return Err(HwError::Nack);
+        }
+        buf.fill(0);
+        Ok(())
+    }
+
+    async fn i2c_write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), HwError> {
+        self.i2c_read(addr, buf).await?;
+        if addr == 0x76 && bytes == [0xD0] {
+            buf[0] = 0x60; // BME280 chip ID register
+        }
+        Ok(())
     }
 }
 

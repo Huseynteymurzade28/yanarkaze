@@ -101,6 +101,15 @@ System:
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
   clear                clear the screen
 
+Hardware (Pico 2 and the simulator for now):
+  pins                 which pins can do what on this board
+  gpio <pin> <action>  on | off | toggle | read [up|down]   e.g. gpio 16 on
+  pwm <pin> <%> [hz]   PWM output, e.g. LED brightness: pwm 16 25   (pwm 16 off)
+  fade <pin> [ms]      make an LED breathe (any key stops)
+  adc <pin> [watch]    read an analog pin in millivolts, e.g. a potentiometer
+  knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16
+  i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
+
 Fun:
   reaction             reflex game: hit the button when the LED turns on
   roll [N]dM           roll dice with the RNG (roll 2d6, roll d20)
@@ -188,6 +197,20 @@ picotool uf2 convert target/thumbv8m.main-none-eabihf/release/yanarkaze-rp-pico2
 cp pico2.uf2 /run/media/$USER/RP2350/  # the drive the Pico 2 shows in BOOTSEL mode
 picocom /dev/ttyACM0
 ```
+
+Wiring for the hardware commands (`pins` prints the full list):
+
+| Part                | Connect                                                             |
+|---------------------|---------------------------------------------------------------------|
+| LED                 | GP16 (pin 21) -> 220-330 ohm resistor -> LED long leg; short leg to GND (pin 23) |
+| Potentiometer       | outer legs to 3V3 (pin 36) and AGND (pin 33), middle leg to GP26 (pin 31) |
+| I2C (OLED, sensors) | SDA to GP4 (pin 6), SCL to GP5 (pin 7), VCC to 3V3 (pin 36), GND to GND (pin 38) |
+
+Then try `fade 16`, `adc 26 watch`, `knob 26 16` and `i2c scan`.
+
+The RP2350's internal pull-downs suffer from erratum E9 (a pin that has been high holds
+itself at about 2 V); `gpio <pin> read down` works around it by briefly disabling the input
+buffer before reading.
 
 After the first flash, the `bootloader` shell command brings the board back to BOOTSEL mode,
 so updates need no replugging.
