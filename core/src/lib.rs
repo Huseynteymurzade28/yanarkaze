@@ -24,6 +24,7 @@ mod keys;
 mod log;
 mod logcmd;
 mod oled;
+mod rgb;
 mod scope;
 mod screens;
 mod script;

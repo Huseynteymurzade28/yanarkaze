@@ -82,7 +82,7 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
 
 const GPIO_ACTIONS: &[&str] = &["on", "off", "toggle", "read"];
 pub(crate) const OLED_ACTIONS: &[&str] =
-    &["text", "temp", "dash", "life", "logo", "preview", "clear", "invert", "contrast", "on", "off"];
+    &["text", "temp", "dash", "life", "logo", "preview", "clear", "invert", "contrast", "on", "off", "color"];
 
 pub(crate) const HW_COMMANDS: &[Command] = &[
     cmd("pins", "", "which pins can do what on this board"),
@@ -106,7 +106,7 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
     cmd("scope", "<pin> [us]", "oscilloscope on the OLED: frequency, duty, Vpp (scope A0 20 [trig mV])"),
     Command {
         completions: OLED_ACTIONS,
-        ..cmd("oled", "<action>", "0.96\" I2C display: text <msg> | temp | dash | life | logo | preview | clear")
+        ..cmd("oled", "<action>", "displays: text <msg> | temp | dash | life | logo | preview | clear | color")
     },
 ];
 
@@ -283,6 +283,8 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) gpio_levels: u64,
     pub(crate) oled: Display,
     pub(crate) oled_ready: bool,
+    /// The colour OLED is switched on (see [`crate::rgb`]).
+    pub(crate) rgb_on: bool,
     pub(crate) oled_inverted: bool,
     pub(crate) settings: Settings,
     /// While the button menu runs, a button press also stops a running command, the way a
@@ -295,9 +297,48 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) log_due: Option<Instant>,
     pub(crate) log_since_boot: bool,
     pub(crate) log_room: Option<crate::env::Found>,
+    /// Big buffers, in a static rather than in the futures of the commands that use them.
+    pub(crate) bufs: &'static mut Bufs,
     /// Deep sleeps since boot, and the seconds spent in them.
     sleeps: u32,
     sleep_secs: u64,
+}
+
+/// The shell's big buffers. They are in a static, built in place: a value made on the stack
+/// and moved (into a future, into the shell) costs its size in stack, and async code does a
+/// lot of that; 8 KB arrays in command futures overflowed the stack.
+pub(crate) struct Bufs {
+    /// A whole file: `cat`, loading `edit`, `save`.
+    pub file: [u8; crate::ember::MAX_SIZE],
+    /// The script `run` is reading (nested scripts re-read their line, so one is enough).
+    pub script: [u8; crate::ember::MAX_SIZE],
+    /// What `edit` is editing.
+    pub text: crate::textedit::Text,
+}
+
+impl Bufs {
+    const fn new() -> Self {
+        Self {
+            file: [0; crate::ember::MAX_SIZE],
+            script: [0; crate::ember::MAX_SIZE],
+            text: crate::textedit::Text::empty(),
+        }
+    }
+}
+
+struct Statics {
+    bufs: Bufs,
+    capture: crate::term::CaptureBufs,
+}
+
+static mut STATICS: Statics = Statics { bufs: Bufs::new(), capture: crate::term::CaptureBufs::new() };
+static STATICS_TAKEN: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+
+/// The statics, handed out once (there is one shell).
+fn take_statics() -> &'static mut Statics {
+    assert!(!STATICS_TAKEN.swap(true, Ordering::AcqRel), "only one shell can run");
+    // SAFETY: the flag above makes this the only reference ever made.
+    unsafe { &mut *core::ptr::addr_of_mut!(STATICS) }
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -305,15 +346,18 @@ pub struct Shell<S: System, R: Read, W: Write> {
 /// `rx` must be cancel-safe: dropping a pending `read` must not lose bytes (ring buffers,
 /// pipes and buffered UARTs are fine).
 pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Spawner) -> ! {
+    let statics = take_statics();
+    let bufs = &mut statics.bufs;
     let mut shell = Shell {
         sys,
         rx,
-        term: Term::new(tx),
+        term: Term::new(tx, &mut statics.capture),
         spawner,
         editor: Editor::new(PROMPT, complete),
         gpio_levels: 0,
         oled: Display::new(),
         oled_ready: false,
+        rgb_on: false,
         oled_inverted: false,
         settings: Settings::default(),
         in_menu: false,
@@ -324,6 +368,7 @@ pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Sp
         log_room: None,
         sleeps: 0,
         sleep_secs: 0,
+        bufs,
     };
     shell.main_loop().await
 }
@@ -468,6 +513,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let n = self.settings.aliases.len();
         if n > 0 {
             out!(self.term, "  {n} alias{} loaded ('alias' lists them)\r\n", if n == 1 { "" } else { "es" });
+        }
+        if self.settings.oled_color && self.rgb_start().await.is_ok() {
+            self.term.print("  colour OLED on\r\n").await;
         }
         if self.settings.autorun.is_empty() {
             return;
@@ -684,7 +732,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     self.menu_stopped = false;
                     self.run_single(&cmd).await;
                     GAME_ACTIVE.store(true, Ordering::Relaxed); // in case the command handed it back
-                    on_oled = self.oled_ready;
+                    on_oled = self.display_ready();
                     // A command that ends by itself (mandel, logo) leaves its picture up
                     // until the next press.
                     if !self.menu_stopped {
@@ -755,9 +803,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     async fn cmd_save(&mut self) {
-        let mut blob = [0u8; settings::BLOB_MAX];
-        let len = self.settings.encode(&mut blob);
-        match self.sys.settings_store(&blob[..len]) {
+        let blob = &mut self.bufs.file[..settings::BLOB_MAX];
+        let len = self.settings.encode(blob);
+        match self.sys.settings_store(&self.bufs.file[..len]) {
             Ok(()) => {
                 let n = self.settings.aliases.len();
                 let autorun = if self.settings.autorun.is_empty() { "no autorun" } else { "an autorun" };
@@ -951,6 +999,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(t, "runtime   : yanarkaze v{VERSION} on embassy-executor (cooperative async)\r\n");
         out!(t, "uptime    : {h:02}:{m:02}:{s:02}\r\n");
         out!(t, "reset     : {reason}\r\n");
+        if let Some((used, total)) = self.sys.stack_usage() {
+            out!(t, "stack     : {} of {} KB at most so far\r\n", used.div_ceil(1024), total / 1024);
+        }
         if self.sleeps > 0 {
             let (n, secs) = (self.sleeps, self.sleep_secs);
             out!(t, "sleep     : {n} time(s), {secs} s in all (not counted in the uptime)\r\n");
@@ -980,6 +1031,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         set_led_mode(LedMode::Off);
         Timer::after_millis(10).await; // the LED task switches it off
         let oled = self.oled_ready && self.oled_cmds(&[0xAE]).await.is_ok(); // display off
+        if self.rgb_on {
+            let _ = self.sys.rgb_command(0xAE, &[]);
+        }
         // A press that wakes the board must not also change the LED mode.
         GAME_ACTIVE.store(true, Ordering::Relaxed);
         BUTTON_SIGNAL.reset();
@@ -1025,6 +1079,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         if oled {
             let _ = self.oled_cmds(&[0xAF]).await;
         }
+        if self.rgb_on {
+            let _ = self.sys.rgb_command(0xAF, &[]);
+        }
         if deep {
             // Only deep sleep stops the uptime clock (and saves real power).
             self.sleeps += 1;
@@ -1061,7 +1118,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             *prev = stat.wakeups();
         }
         let mut last = Instant::now();
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         self.term.print("\x1b[2J\x1b[?25l").await;
         for frame in 0u32.. {
             let mut rates = [None; STATS.len()];

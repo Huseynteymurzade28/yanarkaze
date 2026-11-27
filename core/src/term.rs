@@ -8,20 +8,27 @@ use heapless::String;
 /// The most output `>` and `>>` collect from one command.
 pub const CAPTURE_MAX: usize = 4096;
 
-pub struct Term<W: Write> {
-    tx: W,
-    /// While a command's output goes to a file instead: the text so far.
-    capture: Option<Capture>,
-    /// The capture a nested one interrupted (`run x.ynk > a` with `temp > b` inside).
-    outer: Option<Capture>,
+/// Where captured output goes: one buffer per level of nesting (`run x.ynk > a` with
+/// `temp > b` inside it). They live in a static (see `shell::Statics`) and stay put: moving
+/// 4 KB values around costs that much stack every time.
+pub struct CaptureBufs {
+    text: [heapless::Vec<u8, CAPTURE_MAX>; 2],
+    /// More was printed into that buffer than fits.
+    overflowed: [bool; 2],
 }
 
-/// Output being collected for a file: plain text, without the colours and cursor moves
-/// meant for the terminal, and with `\n` line ends.
-pub struct Capture {
-    pub text: heapless::Vec<u8, CAPTURE_MAX>,
-    /// More was printed than fits.
-    pub overflowed: bool,
+impl CaptureBufs {
+    pub const fn new() -> Self {
+        Self { text: [heapless::Vec::new(), heapless::Vec::new()], overflowed: [false; 2] }
+    }
+}
+
+pub struct Term<W: Write> {
+    tx: W,
+    bufs: &'static mut CaptureBufs,
+    /// Captures running: 0 (output goes to the terminal), 1 or 2.
+    depth: usize,
+    /// Plain text only: colours, cursor moves and the title are dropped, `\r` too.
     escape: Escape,
 }
 
@@ -36,56 +43,63 @@ enum Escape {
     Osc,
 }
 
-impl Capture {
-    fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.escape = match (self.escape, b) {
-                (Escape::None, 0x1b) => Escape::Start,
-                (Escape::None, b'\r' | 0x07) => Escape::None,
-                (Escape::None, _) => {
-                    if self.text.push(b).is_err() {
-                        self.overflowed = true;
-                    }
-                    Escape::None
+/// Feeds terminal output into `text`, keeping the text and leaving out the escapes.
+fn feed(escape: &mut Escape, text: &mut heapless::Vec<u8, CAPTURE_MAX>, overflowed: &mut bool, bytes: &[u8]) {
+    for &b in bytes {
+        *escape = match (*escape, b) {
+            (Escape::None, 0x1b) => Escape::Start,
+            (Escape::None, b'\r' | 0x07) => Escape::None,
+            (Escape::None, _) => {
+                if text.push(b).is_err() {
+                    *overflowed = true;
                 }
-                (Escape::Start, b'[') => Escape::Csi,
-                (Escape::Start, b']') => Escape::Osc,
-                (Escape::Start, _) => Escape::None,
-                (Escape::Csi, 0x40..=0x7e) => Escape::None,
-                (Escape::Csi, _) => Escape::Csi,
-                (Escape::Osc, 0x07) => Escape::None,
-                (Escape::Osc, _) => Escape::Osc,
-            };
-        }
+                Escape::None
+            }
+            (Escape::Start, b'[') => Escape::Csi,
+            (Escape::Start, b']') => Escape::Osc,
+            (Escape::Start, _) => Escape::None,
+            (Escape::Csi, 0x40..=0x7e) => Escape::None,
+            (Escape::Csi, _) => Escape::Csi,
+            (Escape::Osc, 0x07) => Escape::None,
+            (Escape::Osc, _) => Escape::Osc,
+        };
     }
 }
 
 impl<W: Write> Term<W> {
-    pub fn new(tx: W) -> Self {
-        Self { tx, capture: None, outer: None }
+    pub fn new(tx: W, bufs: &'static mut CaptureBufs) -> Self {
+        Self { tx, bufs, depth: 0, escape: Escape::None }
     }
 
     /// From now on, output is collected instead of sent, until [`Self::end_capture`]. One
-    /// capture can nest inside another; deeper ones are not kept apart.
+    /// capture can nest inside another; a third shares the second's buffer.
     pub fn start_capture(&mut self) {
-        let new = Capture { text: heapless::Vec::new(), overflowed: false, escape: Escape::None };
-        if self.outer.is_none() {
-            self.outer = self.capture.replace(new);
-        } else {
-            self.capture = Some(new);
-        }
+        let level = self.depth.min(1);
+        self.bufs.text[level].clear();
+        self.bufs.overflowed[level] = false;
+        self.depth = (self.depth + 1).min(2);
+        self.escape = Escape::None;
     }
 
-    /// Stops the innermost capture and returns it; output goes back to where it went before.
-    pub fn end_capture(&mut self) -> Option<Capture> {
-        let ended = self.capture.take();
-        self.capture = self.outer.take();
-        ended
+    /// Stops the innermost capture. Returns which buffer it filled (for [`Self::captured`])
+    /// and whether some of the output did not fit.
+    pub fn end_capture(&mut self) -> Option<(usize, bool)> {
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
+        Some((self.depth, self.bufs.overflowed[self.depth]))
+    }
+
+    /// The text a capture collected.
+    pub fn captured(&self, level: usize) -> &[u8] {
+        &self.bufs.text[level]
     }
 
     pub async fn write_bytes(&mut self, bytes: &[u8]) {
-        if let Some(capture) = &mut self.capture {
-            capture.feed(bytes);
+        if self.depth > 0 {
+            let level = self.depth - 1;
+            feed(&mut self.escape, &mut self.bufs.text[level], &mut self.bufs.overflowed[level], bytes);
             return;
         }
         // Some drivers (DMA based) reject zero-length transfers, so never send one.
@@ -112,7 +126,7 @@ impl<W: Write> Term<W> {
     }
 
     pub async fn flush(&mut self) {
-        if self.capture.is_none() {
+        if self.depth == 0 {
             let _ = self.tx.flush().await;
         }
     }
@@ -131,9 +145,9 @@ mod tests {
 
     #[test]
     fn capture_keeps_plain_text() {
-        let mut c = Capture { text: heapless::Vec::new(), overflowed: false, escape: Escape::None };
-        c.feed(b"\x1b[1;31mhot\x1b[0m 30 C\r\n\x1b]0;title\x07next\x1b[K\r\n");
-        assert_eq!(c.text.as_slice(), b"hot 30 C\nnext\n");
-        assert!(!c.overflowed);
+        let (mut escape, mut text, mut overflowed) = (Escape::None, heapless::Vec::new(), false);
+        feed(&mut escape, &mut text, &mut overflowed, b"\x1b[1;31mhot\x1b[0m 30 C\r\n\x1b]0;title\x07next\x1b[K\r\n");
+        assert_eq!(text.as_slice(), b"hot 30 C\nnext\n");
+        assert!(!overflowed);
     }
 }

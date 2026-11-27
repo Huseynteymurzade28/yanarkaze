@@ -268,7 +268,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
 
         // The same set at 128x64 on the OLED, in batches so the other tasks keep running.
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         if on_oled {
             for top in (0..crate::oled::HEIGHT).step_by(8) {
                 crate::screens::mandel_rows(&mut self.oled, top..top + 8);
@@ -493,7 +493,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
         self.snake_cell(game.food(), FOOD).await;
         self.term.flush().await;
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         self.snake_oled(&game, None, &mut on_oled).await;
 
         let previous_mode = current_led_mode();
@@ -643,7 +643,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut reached_2048 = false;
         self.term.print("\x1b[2J\x1b[?25l").await;
         self.draw_2048(&board, KEYS).await;
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         self.oled_2048(&board, None, &mut on_oled).await;
 
         let mut buf = [0u8; 16];

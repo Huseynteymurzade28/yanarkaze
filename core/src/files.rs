@@ -39,16 +39,16 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
 
     /// Ends the capture `start_capture` began and writes what it caught into `file`.
     pub(crate) async fn finish_redirect(&mut self, file: &str, append: bool) {
-        let Some(capture) = self.term.end_capture() else { return };
+        let Some((level, overflowed)) = self.term.end_capture() else { return };
+        let text = self.term.captured(level);
+        let len = text.len();
         let result = match ember(&mut self.sys) {
-            Ok(mut fs) if append => fs.append(file, &capture.text).await,
-            Ok(mut fs) => fs.write(file, &capture.text).await,
+            Ok(mut fs) if append => fs.append(file, text).await,
+            Ok(mut fs) => fs.write(file, text).await,
             Err(e) => Err(e),
         };
         match result {
-            Ok(()) if capture.overflowed => {
-                out!(self.term, "note: only the first {} bytes went to {file}\r\n", capture.text.len())
-            }
+            Ok(()) if overflowed => out!(self.term, "note: only the first {len} bytes went to {file}\r\n"),
             Ok(()) => {}
             Err(e) => self.fs_error(e).await,
         }
@@ -76,15 +76,14 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut any = false;
         for name in names {
             any = true;
-            let mut buf = [0u8; ember::MAX_SIZE];
             let read = match ember(&mut self.sys) {
-                Ok(mut fs) => fs.read(name, &mut buf).await,
+                Ok(mut fs) => fs.read(name, &mut self.bufs.file).await,
                 Err(e) => Err(e),
             };
             match read {
                 Ok(n) => {
                     // The terminal wants \r\n; files keep \n.
-                    for line in buf[..n].split_inclusive(|&b| b == b'\n') {
+                    for line in self.bufs.file[..n].split_inclusive(|&b| b == b'\n') {
                         match line.strip_suffix(b"\n") {
                             Some(text) => {
                                 self.term.write_bytes(text).await;

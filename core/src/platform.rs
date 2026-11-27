@@ -60,6 +60,8 @@ pub enum HwError {
     Bus,
     /// The transfer never finished, usually because a device holds SDA or SCL low.
     Timeout,
+    /// The pin is taken by something else right now (the colour OLED).
+    InUse,
 }
 
 impl fmt::Display for HwError {
@@ -72,6 +74,7 @@ impl fmt::Display for HwError {
             HwError::Nack => "no answer from the device",
             HwError::Bus => "bus error (check wiring and pull-ups)",
             HwError::Timeout => "bus timed out (a device may be holding a line low; try 'i2c reset')",
+            HwError::InUse => "that pin is in use by the colour OLED ('oled color off' frees it)",
         })
     }
 }
@@ -272,9 +275,37 @@ pub trait System {
         Err(HwError::Unsupported)
     }
 
+    /// The deepest the stack has gone since boot, and its size, in bytes: (used, total).
+    /// A board that paints its stack at boot can tell; `None` otherwise.
+    fn stack_usage(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Typical current drawn by the microcontroller alone, awake and in [`Self::deep_sleep`],
     /// in microamps, for the estimate in `info`.
     fn power_estimate(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Takes (`true`) or releases the pins of a colour OLED on SPI (an SSD1351, 128x128),
+    /// and pulses its reset line. See [`crate::rgb`].
+    fn rgb_enable(&mut self, _on: bool) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Sends a command to the colour OLED, with its parameters (DC low for the command byte,
+    /// high for the rest).
+    fn rgb_command(&mut self, _cmd: u8, _params: &[u8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Sends pixel data to the colour OLED (DC high).
+    fn rgb_data(&mut self, _data: &[u8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// How to wire the colour OLED, for messages; `None` if the board has no pins for it.
+    fn rgb_pins(&self) -> Option<&'static str> {
         None
     }
 

@@ -32,13 +32,27 @@ pub struct Text {
 }
 
 impl Text {
+    #[cfg(test)]
     pub fn new(content: &[u8]) -> Self {
-        let mut bytes = heapless::Vec::new();
+        let mut text = Self::empty();
+        text.load(content);
+        text
+    }
+
+    pub const fn empty() -> Self {
+        Self { bytes: heapless::Vec::new(), cursor: 0, goal: None, modified: false }
+    }
+
+    /// Replaces the whole text, cursor at the start.
+    pub fn load(&mut self, content: &[u8]) {
+        self.bytes.clear();
         // Carriage returns from files made elsewhere would only confuse the screen.
         for &b in content.iter().filter(|&&b| b != b'\r') {
-            let _ = bytes.push(b);
+            let _ = self.bytes.push(b);
         }
-        Self { bytes, cursor: 0, goal: None, modified: false }
+        self.cursor = 0;
+        self.goal = None;
+        self.modified = false;
     }
 
     fn line_start(&self, pos: usize) -> usize {
@@ -210,24 +224,28 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             out!(self.term, "error: {}\r\n", ember::FsError::BadName);
             return;
         }
-        let mut content = [0u8; MAX];
+        // The buffers live in the shell, not in this function's future: async call chains
+        // copy futures through the stack, and 16 KB of them overflowed it.
         let loaded = match open_ember(&mut self.sys) {
-            Ok(mut fs) => match fs.read(name, &mut content).await {
+            Ok(mut fs) => match fs.read(name, &mut self.bufs.file).await {
                 Ok(n) => Ok(Some(n)),
                 Err(ember::FsError::NotFound) => Ok(None),
                 Err(e) => Err(e),
             },
             Err(e) => Err(e),
         };
-        let (mut text, mut message) = match loaded {
-            Ok(Some(n)) => (Text::new(&content[..n]), String::<64>::new()),
-            Ok(None) => (Text::new(b""), String::try_from("new file").unwrap_or_default()),
+        let mut message = String::<64>::new();
+        match loaded {
+            Ok(Some(n)) => self.bufs.text.load(&self.bufs.file[..n]),
+            Ok(None) => {
+                self.bufs.text.load(b"");
+                let _ = message.push_str("new file");
+            }
             Err(e) => {
                 out!(self.term, "error: {e}\r\n");
                 return;
             }
-        };
-
+        }
         let (rows, cols) = self.screen_size().await;
         let mut view = View { rows: rows.saturating_sub(1).max(1), cols: cols.max(20), ..View::default() };
         // The alternate screen: the shell's scrollback comes back untouched afterwards.
@@ -235,6 +253,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut keys = KeyDecoder::new();
         let mut drawn: Option<(View, usize, usize)> = None; // view, line count, cursor line
         let mut quit_armed = false;
+        let text = &mut self.bufs.text;
         'edit: loop {
             view.follow(text.line(), text.col());
             let state = (view, text.line_count(), text.line());
@@ -243,9 +262,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             let full = drawn.is_none_or(|(v, count, _)| v != view || count != state.1);
             let lines = if full { view.top..view.top + view.rows } else { state.2..state.2 + 1 };
             for n in lines {
-                self.draw_line(&text, view, n).await;
+                draw_line(&mut self.term, text, view, n).await;
             }
-            self.draw_status(&text, view, name, &message).await;
+            draw_status(&mut self.term, text, view, name, &message).await;
             out!(self.term, "\x1b[{};{}H", text.line() - view.top + 1, text.col() - view.left + 1);
             self.term.flush().await;
             drawn = Some(state);
@@ -314,42 +333,6 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         self.term.print("\x1b[?1049l").await;
     }
 
-    /// Line `n` of the text at its screen row, or `~` past the end.
-    async fn draw_line(&mut self, text: &Text, view: View, n: usize) {
-        if n < view.top || n >= view.top + view.rows {
-            return;
-        }
-        out!(self.term, "\x1b[{};1H", n - view.top + 1);
-        let mut line: String<512> = String::new();
-        match text.line_range(n) {
-            Some(range) => {
-                let s = core::str::from_utf8(&text.bytes[range]).unwrap_or("?");
-                for c in s.chars().skip(view.left).take(view.cols) {
-                    let _ = line.push(if c == '\t' { ' ' } else { c });
-                }
-            }
-            None => {
-                let _ = line.push_str("\x1b[2m~\x1b[0m");
-            }
-        }
-        let _ = line.push_str("\x1b[K");
-        self.term.print(&line).await;
-    }
-
-    async fn draw_status(&mut self, text: &Text, view: View, name: &str, message: &str) {
-        let mut status: String<256> = String::new();
-        let modified = if text.modified { " [modified]" } else { "" };
-        let _ = write!(
-            status,
-            " {name}{modified}  line {}/{}, col {}  ^S save  ^X quit  {message}",
-            text.line() + 1,
-            text.line_count(),
-            text.col() + 1
-        );
-        let width = view.cols.min(status.len());
-        out!(self.term, "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K", view.rows + 1, &status[..width]);
-    }
-
     /// Asks the terminal how big it is (moving the cursor far away and asking where it
     /// ended up); 24x80 if it does not answer.
     async fn screen_size(&mut self) -> (usize, usize) {
@@ -370,6 +353,42 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
         parse_size(&reply).unwrap_or((24, 80))
     }
+}
+
+/// Line `n` of the text at its screen row, or `~` past the end.
+async fn draw_line<W: Write>(term: &mut crate::term::Term<W>, text: &Text, view: View, n: usize) {
+    if n < view.top || n >= view.top + view.rows {
+        return;
+    }
+    out!(term, "\x1b[{};1H", n - view.top + 1);
+    let mut line: String<512> = String::new();
+    match text.line_range(n) {
+        Some(range) => {
+            let s = core::str::from_utf8(&text.bytes[range]).unwrap_or("?");
+            for c in s.chars().skip(view.left).take(view.cols) {
+                let _ = line.push(if c == '\t' { ' ' } else { c });
+            }
+        }
+        None => {
+            let _ = line.push_str("\x1b[2m~\x1b[0m");
+        }
+    }
+    let _ = line.push_str("\x1b[K");
+    term.print(&line).await;
+}
+
+async fn draw_status<W: Write>(term: &mut crate::term::Term<W>, text: &Text, view: View, name: &str, message: &str) {
+    let mut status: String<256> = String::new();
+    let modified = if text.modified { " [modified]" } else { "" };
+    let _ = write!(
+        status,
+        " {name}{modified}  line {}/{}, col {}  ^S save  ^X quit  {message}",
+        text.line() + 1,
+        text.line_count(),
+        text.col() + 1
+    );
+    let width = view.cols.min(status.len());
+    out!(term, "\x1b[{};1H\x1b[7m{:<width$}\x1b[0m\x1b[K", view.rows + 1, &status[..width]);
 }
 
 /// Reads `ESC [ rows ; cols R`.

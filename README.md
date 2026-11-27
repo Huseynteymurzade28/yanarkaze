@@ -120,8 +120,9 @@ Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   plot <what> [ms]     live chart on the OLED: temp | env | rh | hpa | <adc pin>  (plot A0 50)
   scope <pin> [us]     oscilloscope on the OLED: frequency, duty, Vpp; + / - change the time
                        base, a third argument sets the trigger level (scope A0 20 1500)
-  oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
-                       | clear | invert | contrast <0-255> | on | off
+  oled <action>        SSD1306 OLED at 0x3C (and a colour SSD1351): text <msg> | temp | dash |
+                       life | logo | preview | clear | invert | contrast <0-255> | on | off |
+                       color on|off|test|mandel
 
 Files (ember, in flash: NUCLEO and the simulator):
   ls                   list the files
@@ -267,6 +268,24 @@ the -P (many others differ between the two). Type them by Arduino name or MCU na
 | PC1, PC0  | GPIO, ADC   | A4, A5       |
 | PA10, PB5 | GPIO        | D2, D4       |
 | PB3, PB10 | GPIO, PWM   | D3, D6 (both on TIM2, so they share one frequency) |
+
+A colour OLED, the 1.5" 128x128 SSD1351 on SPI, works too (seven pins):
+
+| OLED | NUCLEO      |
+|------|-------------|
+| GND  | GND         |
+| VCC  | 3V3         |
+| SCL  | D3 (SPI1 SCK, PB3) |
+| SDA  | D4 (SPI1 MOSI, PB5) |
+| RES  | D2          |
+| DC   | A4          |
+| CS   | A5          |
+
+An SPI display cannot say it is there, so switch it on with `oled color on` (and `save` to
+keep it on). Every `oled` screen (`dash`, `top`, `plot`, `scope`, `snake`, the menu...)
+then shows on it as well, twice as tall and in the colours of a fire; with only the colour
+one attached, that is enough. `oled color test` shows colour bars, `oled color mandel` a
+full-colour Mandelbrot. While it is on, D2, D3, D4, A4 and A5 belong to it.
 
 For `knob A0 D3`: a potentiometer's outer legs to 3V3 and GND and its middle leg to A0, and
 an LED from D3 through a 220-330 ohm resistor to GND.

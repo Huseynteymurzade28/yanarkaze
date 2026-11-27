@@ -122,13 +122,12 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             next: 0,
             pending: String::new(),
         });
-        let mut buf = [0u8; ember::MAX_SIZE];
         'frames: while let Some(top) = stack.last_mut() {
             let line: String<LINE> = if !top.pending.is_empty() {
                 core::mem::take(&mut top.pending)
             } else {
                 let read = match open_ember(&mut self.sys) {
-                    Ok(mut fs) => fs.read(&top.name, &mut buf).await,
+                    Ok(mut fs) => fs.read(&top.name, &mut self.bufs.script).await,
                     Err(e) => Err(e),
                 };
                 let n = match read {
@@ -143,8 +142,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     stack.pop();
                     continue;
                 }
-                let end = buf[top.next..n].iter().position(|&b| b == b'\n').map_or(n, |i| top.next + i);
-                let raw = core::str::from_utf8(&buf[top.next..end]).unwrap_or("").trim();
+                let end = self.bufs.script[top.next..n].iter().position(|&b| b == b'\n').map_or(n, |i| top.next + i);
+                let raw = core::str::from_utf8(&self.bufs.script[top.next..end]).unwrap_or("").trim();
                 top.next = end + 1;
                 if raw.is_empty() || raw.starts_with('#') {
                     continue;

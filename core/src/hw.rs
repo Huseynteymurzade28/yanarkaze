@@ -277,7 +277,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let (adc_name, pwm_name) = (self.pin_name(adc), self.pin_name(pwm));
         out!(self.term, "turn the knob on {adc_name}: it sets the brightness on {pwm_name} (any key stops)\r\n");
         // The OLED shows a dial; it only needs redrawing when the reading moves.
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         let mut shown = u32::MAX;
         loop {
             let mv = match self.sys.adc_read(adc).await {
@@ -319,7 +319,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         if watch {
             self.term.print("live, every second (any key stops)\r\n").await;
         }
-        let mut on_oled = self.oled_ready;
+        let mut on_oled = self.display_ready();
         for round in 0u32.. {
             if round > 0 {
                 out!(self.term, "\x1b[{}A", sensors.len()); // back over the previous lines
@@ -707,10 +707,19 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     /// Initialises the display the first time it is used.
     pub(crate) async fn oled_init(&mut self) -> Result<(), HwError> {
         if !self.oled_ready {
-            self.oled_cmds(&oled::INIT).await?;
-            self.oled_ready = true;
+            match self.oled_cmds(&oled::INIT).await {
+                Ok(()) => self.oled_ready = true,
+                // The colour OLED alone is enough to draw on.
+                Err(_) if self.rgb_on => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
+    }
+
+    /// Whether some display (the small OLED, the colour one, or both) shows the framebuffer.
+    pub(crate) fn display_ready(&self) -> bool {
+        self.oled_ready || self.rgb_on
     }
 
     /// Sends the whole framebuffer.
@@ -723,8 +732,24 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
+    /// Sends the framebuffer to the small OLED and, if it is on, the colour one; fine if
+    /// either takes it.
     pub(crate) async fn oled_flush(&mut self) -> Result<(), HwError> {
-        self.oled_init().await?;
+        let mono = self.mono_flush().await;
+        if self.rgb_on {
+            let color = crate::rgb::show_mono(&mut self.sys, &self.oled.fb);
+            if mono.is_err() {
+                return color;
+            }
+        }
+        mono
+    }
+
+    async fn mono_flush(&mut self) -> Result<(), HwError> {
+        if !self.oled_ready {
+            self.oled_cmds(&oled::INIT).await?;
+            self.oled_ready = true;
+        }
         self.oled_cmds(&oled::WINDOW).await?;
         let mut buf = [0u8; 1 + oled::WIDTH];
         buf[0] = oled::DATA;
@@ -771,8 +796,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     pub(crate) async fn cmd_oled(&mut self, rest: &str) {
-        const USAGE: &str =
-            "oled text <msg> | temp | dash | life | logo | preview | clear | invert | contrast <0-255> | on | off";
+        const USAGE: &str = "oled text <msg> | temp | dash | life | logo | preview | clear | invert | contrast <0-255> | on | off | color on|off|test|mandel";
         let (typed, arg) = crate::shell::split_word(rest);
         // Accept unambiguous abbreviations: `oled tex hi` is `oled text hi`.
         let Some(action) = crate::shell::resolve(typed, crate::shell::OLED_ACTIONS) else {
@@ -798,28 +822,47 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 self.oled_logo();
                 self.oled_flush().await
             }
+            "color" => {
+                self.oled_color(arg).await;
+                return;
+            }
             "invert" => {
                 self.oled_inverted = !self.oled_inverted;
+                // The same command on both controllers.
                 let cmd = if self.oled_inverted { 0xA7 } else { 0xA6 };
+                if self.rgb_on {
+                    let _ = self.sys.rgb_command(cmd, &[]);
+                }
                 match self.oled_init().await {
-                    Ok(()) => self.oled_cmds(&[cmd]).await,
-                    Err(e) => Err(e),
+                    Ok(()) if self.oled_ready => self.oled_cmds(&[cmd]).await,
+                    other => other,
                 }
             }
             "contrast" => match arg.parse::<u8>() {
-                Ok(level) => match self.oled_init().await {
-                    Ok(()) => self.oled_cmds(&[0x81, level]).await,
-                    Err(e) => Err(e),
-                },
+                Ok(level) => {
+                    if self.rgb_on {
+                        let _ = self.sys.rgb_command(0xC7, &[level >> 4]); // 16 steps there
+                    }
+                    match self.oled_init().await {
+                        Ok(()) if self.oled_ready => self.oled_cmds(&[0x81, level]).await,
+                        other => other,
+                    }
+                }
                 Err(_) => {
                     self.term.print("usage: oled contrast <0-255>\r\n").await;
                     return;
                 }
             },
-            "on" | "off" => match self.oled_init().await {
-                Ok(()) => self.oled_cmds(&[if action == "on" { 0xAF } else { 0xAE }]).await,
-                Err(e) => Err(e),
-            },
+            "on" | "off" => {
+                let cmd = if action == "on" { 0xAF } else { 0xAE };
+                if self.rgb_on {
+                    let _ = self.sys.rgb_command(cmd, &[]);
+                }
+                match self.oled_init().await {
+                    Ok(()) if self.oled_ready => self.oled_cmds(&[cmd]).await,
+                    other => other,
+                }
+            }
             "preview" => {
                 self.oled_preview().await;
                 return;
@@ -834,6 +877,68 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         };
         if let Err(e) = result {
             self.oled_error(e).await;
+        }
+    }
+
+    /// Switches the colour OLED on (with the logo) or off. Also from the saved settings at boot.
+    pub(crate) async fn rgb_start(&mut self) -> Result<(), HwError> {
+        crate::rgb::init(&mut self.sys)?;
+        self.rgb_on = true;
+        self.oled_logo();
+        self.oled_flush().await
+    }
+
+    async fn oled_color(&mut self, arg: &str) {
+        let pins = self.sys.rgb_pins().unwrap_or("");
+        match arg.trim() {
+            "on" => match self.rgb_start().await {
+                Ok(()) => {
+                    self.settings.oled_color = true;
+                    out!(self.term, "colour OLED on: every oled screen shows there too{}\r\n", crate::shell::UNSAVED);
+                    out!(self.term, "(nothing to see? an SPI display cannot answer, so check the wiring: {pins})\r\n");
+                }
+                Err(HwError::Unsupported) => {
+                    self.term.print("this board has no pins set aside for a colour OLED\r\n").await
+                }
+                Err(e) => self.hw_error(e).await,
+            },
+            "off" => {
+                if self.rgb_on {
+                    let _ = self.sys.rgb_command(0xAE, &[]);
+                    let _ = self.sys.rgb_enable(false);
+                }
+                self.rgb_on = false;
+                self.settings.oled_color = false;
+                out!(self.term, "colour OLED off, its pins are free again{}\r\n", crate::shell::UNSAVED);
+            }
+            "test" | "mandel" if !self.rgb_on => self.term.print("the colour OLED is off ('oled color on')\r\n").await,
+            "test" => match crate::rgb::test_pattern(&mut self.sys) {
+                Ok(()) => {
+                    self.term
+                        .print("on top, from the left: white, yellow, cyan, green, magenta, red, blue, black\r\n")
+                        .await;
+                    self.term.print("below: a red, a green and a blue ramp, dark on the left\r\n").await;
+                }
+                Err(e) => self.hw_error(e).await,
+            },
+            "mandel" => {
+                let start = embassy_time::Instant::now();
+                let mut iterations = 0;
+                for first in (0..crate::rgb::SIZE).step_by(8) {
+                    match crate::rgb::mandel_rows(&mut self.sys, first..first + 8) {
+                        Ok(n) => iterations += n,
+                        Err(e) => {
+                            self.hw_error(e).await;
+                            return;
+                        }
+                    }
+                    embassy_futures::yield_now().await; // let the other tasks run
+                }
+                let ms = start.elapsed().as_millis();
+                out!(self.term, "{iterations} iterations, drawn in {ms} ms\r\n");
+            }
+            _ if pins.is_empty() => self.term.print("usage: oled color on | off | test | mandel\r\n").await,
+            _ => out!(self.term, "usage: oled color on | off | test | mandel   (wiring: {pins})\r\n"),
         }
     }
 

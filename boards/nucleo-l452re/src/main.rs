@@ -119,6 +119,16 @@ static PINS: [PinInfo; 8] = [
     PinInfo { pin: PB + 10, gpio: true, pwm: true, adc: false, note: "D6 (TIM2 CH3, same frequency as D3)" },
 ];
 
+/// The colour OLED (SSD1351) on SPI1: SCK on D3 (PB3) and MOSI on D4 (PB5), both AF5, with
+/// RES on D2, DC on A4 and CS on A5. These Arduino pins are the same on both boards, and
+/// leave the LED (on D13, the usual SPI clock) and A0 alone.
+const RGB_SCK: u8 = PB + 3;
+const RGB_MOSI: u8 = PB + 5;
+const RGB_RES: u8 = PA + 10;
+const RGB_DC: u8 = PC + 1;
+const RGB_CS: u8 = PC + 0;
+const RGB_PINS: [u8; 5] = [RGB_SCK, RGB_MOSI, RGB_RES, RGB_DC, RGB_CS];
+
 static ALIASES: [(&str, u8); 8] = [
     ("A0", PA + 0),
     ("A1", PA + 1),
@@ -144,6 +154,30 @@ const ADC_PINS: [u8; 4] = [PA + 0, PA + 1, PC + 1, PC + 0];
 /// PWM pins: (pin, TIM2 channel index 0..=3). Both are alternate function 1.
 const PWM_PINS: [(u8, usize); 2] = [(PB + 3, 1), (PB + 10, 2)];
 const TIM2_HZ: u32 = CPU_MHZ * 1_000_000; // APB1 is not divided, so TIM2 runs at SYSCLK
+
+/// Drives an output pin through BSRR (one write, no read-modify-write).
+fn gpio_set(pin: u8, high: bool) {
+    let bit = (pin % 16) as usize;
+    gpio_port(pin).bsrr().write(|w| if high { w.set_bs(bit, true) } else { w.set_br(bit, true) });
+}
+
+/// Clocks bytes out of SPI1 and waits until the last one has left, so that DC and CS can
+/// change right after. What comes back is thrown away (nothing is wired to MISO).
+fn spi1_send(bytes: &[u8]) {
+    let spi = pac::SPI1;
+    for &b in bytes {
+        while !spi.sr().read().txe() {}
+        spi.dr8().write_value(b);
+        // Keep the receive FIFO from overflowing.
+        while spi.sr().read().frlvl() != pac::spi::vals::Frlvl::EMPTY {
+            let _ = spi.dr8().read();
+        }
+    }
+    while spi.sr().read().bsy() {}
+    while spi.sr().read().frlvl() != pac::spi::vals::Frlvl::EMPTY {
+        let _ = spi.dr8().read();
+    }
+}
 
 fn gpio_port(pin: u8) -> pac::gpio::Gpio {
     match pin / 16 {
@@ -306,10 +340,15 @@ struct NucleoSystem {
     flash: Flash<'static, flash::Blocking>,
     /// The USER button's polarity (see [`UserButton`]), for telling what woke a deep sleep.
     button_active_high: bool,
+    /// The colour OLED has its pins (see [`RGB_PINS`]).
+    rgb_on: bool,
 }
 
 impl NucleoSystem {
     fn check_pin(&self, pin: u8, can: impl Fn(&PinInfo) -> bool) -> Result<(), HwError> {
+        if self.rgb_on && RGB_PINS.contains(&pin) {
+            return Err(HwError::InUse);
+        }
         match PINS.iter().find(|p| p.pin == pin) {
             Some(p) if can(p) => Ok(()),
             Some(_) => Err(HwError::WrongPin),
@@ -637,6 +676,16 @@ impl System for NucleoSystem {
         Ok(Slept { secs, woke_by })
     }
 
+    fn stack_usage(&self) -> Option<(usize, usize)> {
+        let (bottom, top) = stack_bounds();
+        // The lowest word that no longer holds the paint is as deep as the stack has been.
+        let mut addr = bottom;
+        while addr < top && unsafe { (addr as *const u32).read_volatile() } == STACK_PAINT {
+            addr += 4;
+        }
+        Some((top - addr, top - bottom))
+    }
+
     fn power_estimate(&self) -> Option<(u32, u32)> {
         // STM32L452 datasheet, typical: about 8 mA running at 80 MHz from flash, about 1 uA
         // in Stop 2 with the RTC.
@@ -679,6 +728,82 @@ impl System for NucleoSystem {
             self.flash.blocking_write(offset, &word).map_err(|_| HwError::Bus)?;
         }
         Ok(())
+    }
+
+    fn rgb_enable(&mut self, on: bool) -> Result<(), HwError> {
+        use pac::gpio::vals::{Moder, Ospeedr};
+        let spi = pac::SPI1;
+        if !on {
+            spi.cr1().modify(|w| w.set_spe(false));
+            for pin in RGB_PINS {
+                Self::set_mode(pin, Moder::INPUT);
+            }
+            self.rgb_on = false;
+            return Ok(());
+        }
+        pac::RCC.apb2enr().modify(|w| w.set_spi1en(true));
+        for pin in [RGB_SCK, RGB_MOSI] {
+            let (port, bit) = (gpio_port(pin), (pin % 16) as usize);
+            port.ospeedr().modify(|w| w.set_ospeedr(bit, Ospeedr::VERY_HIGH_SPEED));
+            port.afr(bit / 8).modify(|w| w.set_afr(bit % 8, 5)); // AF5 = SPI1
+            Self::set_mode(pin, Moder::ALTERNATE);
+        }
+        gpio_set(RGB_CS, true);
+        gpio_set(RGB_DC, false);
+        gpio_set(RGB_RES, true);
+        for pin in [RGB_RES, RGB_DC, RGB_CS] {
+            Self::set_mode(pin, Moder::OUTPUT);
+        }
+        // Master, mode 0, 80 MHz / 8 = 10 MHz (the SSD1351 takes up to 20), 8-bit frames,
+        // software chip select (CS is a GPIO).
+        spi.cr1().write(|w| {
+            w.set_mstr(pac::spi::vals::Mstr::MASTER);
+            w.set_br(pac::spi::vals::Br::DIV8);
+            w.set_ssm(true);
+            w.set_ssi(true);
+        });
+        spi.cr2().write(|w| {
+            w.set_ds(pac::spi::vals::Ds::BITS8);
+            w.set_frxth(pac::spi::vals::Frxth::QUARTER);
+        });
+        spi.cr1().modify(|w| w.set_spe(true));
+        // Reset pulse.
+        gpio_set(RGB_RES, false);
+        cortex_m::asm::delay(CPU_MHZ * 1000); // 1 ms
+        gpio_set(RGB_RES, true);
+        cortex_m::asm::delay(CPU_MHZ * 1000);
+        self.rgb_on = true;
+        Ok(())
+    }
+
+    fn rgb_command(&mut self, cmd: u8, params: &[u8]) -> Result<(), HwError> {
+        if !self.rgb_on {
+            return Err(HwError::Unsupported);
+        }
+        gpio_set(RGB_CS, false);
+        gpio_set(RGB_DC, false);
+        spi1_send(&[cmd]);
+        if !params.is_empty() {
+            gpio_set(RGB_DC, true);
+            spi1_send(params);
+        }
+        gpio_set(RGB_CS, true);
+        Ok(())
+    }
+
+    fn rgb_data(&mut self, data: &[u8]) -> Result<(), HwError> {
+        if !self.rgb_on {
+            return Err(HwError::Unsupported);
+        }
+        gpio_set(RGB_CS, false);
+        gpio_set(RGB_DC, true);
+        spi1_send(data);
+        gpio_set(RGB_CS, true);
+        Ok(())
+    }
+
+    fn rgb_pins(&self) -> Option<&'static str> {
+        Some("GND, VCC to 3V3, SCL to D3, SDA to D4, RES to D2, DC to A4, CS to A5")
     }
 
     fn i2c_pins(&self) -> Option<&'static str> {
@@ -740,6 +865,19 @@ impl NucleoSystem {
         }
         Ok(start + offset as u32)
     }
+}
+
+/// cortex-m-rt paints the stack with this before anything runs (its `paint-stack` feature).
+const STACK_PAINT: u32 = cortex_m_rt::STACK_PAINT_VALUE;
+
+/// The stack's lowest and highest address: it grows down from the end of RAM towards the
+/// statics.
+fn stack_bounds() -> (usize, usize) {
+    unsafe extern "C" {
+        static _stack_end: u32;
+        static _stack_start: u32;
+    }
+    ((&raw const _stack_end) as usize, (&raw const _stack_start) as usize)
 }
 
 /// Turns the RTC's wakeup timer on (once a second) or off. Returns false if the RTC clock
@@ -932,7 +1070,16 @@ async fn main(spawner: Spawner) {
     let adc_pins = [p.PA0.degrade_adc(), p.PA1.degrade_adc(), p.PC1.degrade_adc(), p.PC0.degrade_adc()];
     let adc = &*ADC.init(Mutex::new(AdcBank::new(p.ADC1, adc_pins).await));
     let flash = Flash::new_blocking(p.FLASH);
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc, flash, button_active_high };
+    let sys = NucleoSystem {
+        rng: Rng::new(p.RNG, Irqs),
+        reset_reason,
+        i2c,
+        sda,
+        adc,
+        flash,
+        button_active_high,
+        rgb_on: false,
+    };
 
     spawner.spawn(shell_task(sys, uart_rx, ConsoleTx(uart_tx), spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());

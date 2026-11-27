@@ -18,7 +18,7 @@ pub const MAX_ALIASES: usize = 16;
 pub const NAME_LEN: usize = 16;
 pub const BODY_LEN: usize = 80;
 /// The largest blob [`Settings::encode`] produces (all aliases and the autorun at full length).
-pub const BLOB_MAX: usize = HEADER + MAX_ALIASES * (6 + NAME_LEN + 1 + BODY_LEN + 1) + 8 + BODY_LEN + 1 + 16;
+pub const BLOB_MAX: usize = HEADER + MAX_ALIASES * (6 + NAME_LEN + 1 + BODY_LEN + 1) + 8 + BODY_LEN + 1 + 16 + 11;
 
 const MAGIC: &[u8; 4] = b"YNKZ";
 const VERSION: u8 = 1;
@@ -31,6 +31,8 @@ pub struct Settings {
     pub autorun: String<BODY_LEN>,
     /// Seconds between temperature log records; 0 when the log is off.
     pub log_secs: u32,
+    /// The colour OLED is wired up (`oled color on`).
+    pub oled_color: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +117,9 @@ impl Settings {
             put(&self.autorun);
             put("\n");
         }
+        if self.oled_color {
+            put("oled color\n");
+        }
         let mut log: String<16> = String::new();
         if self.log_secs > 0 && core::fmt::Write::write_fmt(&mut log, format_args!("log {}\n", self.log_secs)).is_ok() {
             put(&log);
@@ -151,6 +156,7 @@ impl Settings {
                     let _ = settings.set_autorun(rest);
                 }
                 "log" => settings.log_secs = rest.parse().unwrap_or(0),
+                "oled" => settings.oled_color = rest == "color",
                 _ => {}
             }
         }
@@ -258,6 +264,7 @@ mod tests {
         let mut s = with(&[("blink", "repeat 5 led toggle"), ("hot", "alert 30; temp")]);
         s.set_autorun("led heartbeat; oled dash").unwrap();
         s.log_secs = 60;
+        s.oled_color = true;
         let mut blob = [0u8; BLOB_MAX];
         let n = s.encode(&mut blob);
         assert_eq!(Settings::decode(&blob[..n]), Some(s.clone()));
