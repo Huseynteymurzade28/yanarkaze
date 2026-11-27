@@ -186,9 +186,8 @@ D14 is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P; the firmware fin
 boot from the module's pull-ups, so attach the display before powering up.
 
 Then `i2c scan` should find the display at 0x3C, the logo appears at the next boot, and
-`oled dash`, `snake` and `2048` draw on it. I2C is blocking on this board (through DMA2,
-a failed transfer stalled the console's DMA), so a full OLED frame pauses the other tasks
-for about 25 ms.
+`oled dash`, `snake` and `2048` draw on it. I2C is blocking on this board, so a full OLED
+frame pauses the other tasks for about 25 ms.
 
 ### Raspberry Pi Pico
 

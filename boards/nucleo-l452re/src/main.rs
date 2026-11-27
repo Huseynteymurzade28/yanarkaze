@@ -159,6 +159,34 @@ impl Watchdog for Iwdg {
     }
 }
 
+/// The console's TX with a bounded `flush`.
+///
+/// embassy-stm32 0.6's `RingBufferedUartRx` clears every USART status flag it saw when it
+/// checks for errors, including TC (transmission complete), which belongs to TX. If a
+/// transmission ends just before such a check, TC is gone and `UartTx::flush`, which waits
+/// for it, never returns: the shell froze after a minute or two of snake. `write` already
+/// waits for its DMA transfer, so all `flush` adds is the last two bytes leaving the shift
+/// register (under 200 us at 115200 baud); a 2 ms cap is plenty, and the next transmission
+/// sets TC again.
+struct ConsoleTx(UartTx<'static, Async>);
+
+impl embedded_io_async::ErrorType for ConsoleTx {
+    type Error = usart::Error;
+}
+
+impl embedded_io_async::Write for ConsoleTx {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.0.write(buf).await?;
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        // A timeout means TC was lost, not that anything failed.
+        let _ = embassy_time::with_timeout(Duration::from_millis(2), self.0.flush()).await;
+        Ok(())
+    }
+}
+
 struct NucleoSystem {
     rng: Rng<'static, RNG>,
     reset_reason: &'static str,
@@ -330,7 +358,7 @@ fn read_reset_reason() -> &'static str {
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::task]
-async fn shell_task(sys: NucleoSystem, rx: RingBufferedUartRx<'static>, tx: UartTx<'static, Async>, spawner: Spawner) {
+async fn shell_task(sys: NucleoSystem, rx: RingBufferedUartRx<'static>, tx: ConsoleTx, spawner: Spawner) {
     yanarkaze_core::shell::run(sys, rx, tx, spawner).await
 }
 
@@ -401,10 +429,10 @@ async fn main(spawner: Spawner) {
     // I2C1 on the Arduino header's SCL/SDA (D15/D14). The internal pull-ups are weak
     // (about 40k); most OLED modules bring their own, which is what makes 400 kHz work.
     //
-    // Blocking on purpose: driven through DMA2 (DMA1 channels 6 and 7 are the console's),
-    // the first NACKed transfer left the console's TX DMA hanging with embassy-stm32 0.6.
-    // A full OLED frame at 400 kHz holds the executor for about 25 ms; console input is
-    // safe meanwhile in its DMA ring buffer.
+    // Blocking: with I2C1 on DMA2 (DMA1 channels 6 and 7 are the console's) the console
+    // froze right at boot. That was probably the lost-TC bug `ConsoleTx` works around, but
+    // DMA I2C has not been retried since. A full OLED frame at 400 kHz holds the executor
+    // for about 25 ms; console input is safe meanwhile in its DMA ring buffer.
     let mut i2c_config = i2c::Config::default();
     i2c_config.frequency = Hertz(400_000);
     i2c_config.sda_pullup = true;
@@ -420,7 +448,7 @@ async fn main(spawner: Spawner) {
     };
     let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda };
 
-    spawner.spawn(shell_task(sys, uart_rx, uart_tx, spawner).unwrap());
+    spawner.spawn(shell_task(sys, uart_rx, ConsoleTx(uart_tx), spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());
     spawner.spawn(button_task(button).unwrap());
     spawner.spawn(sensor_task(p.ADC1).unwrap());
