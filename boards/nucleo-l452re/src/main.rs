@@ -7,7 +7,7 @@
 //!   sensor   -> internal temperature sensor + VREFINT through ADC1
 //!   watchdog -> IWDG, 2 s timeout
 //!   RNG      -> hardware TRNG (48 MHz from HSI48)
-//!   I2C      -> I2C1 on PB8 (SCL, Arduino D15) and PB9 (SDA, D14), blocking (see main)
+//!   I2C      -> I2C1 on Arduino D15 (SCL, PB8) and D14 (SDA: PB9, or PB7 on the -P board)
 
 #![no_std]
 #![no_main]
@@ -22,7 +22,7 @@ use embassy_embedded_hal::SetConfig;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::peripherals::{ADC1, IWDG, RNG};
 use embassy_stm32::rng::{self, Rng};
@@ -44,9 +44,8 @@ bind_interrupts!(struct Irqs {
 });
 
 const I2C_TIMEOUT: Duration = Duration::from_millis(50);
-/// I2C1 pins on GPIOB.
+/// I2C1 SCL on GPIOB. SDA is chosen at boot, see `find_sda`.
 const I2C_SCL: usize = 8;
-const I2C_SDA: usize = 9;
 
 const CPU_MHZ: u32 = 80;
 
@@ -164,6 +163,8 @@ struct NucleoSystem {
     rng: Rng<'static, RNG>,
     reset_reason: &'static str,
     i2c: I2c<'static, Blocking, i2c::Master>,
+    /// GPIOB pin number of SDA: 9 on the NUCLEO-L452RE, 7 on the NUCLEO-L452RE-P.
+    sda: usize,
 }
 
 impl NucleoSystem {
@@ -186,6 +187,7 @@ impl NucleoSystem {
     fn recover_bus(&mut self) -> Result<(bool, bool), HwError> {
         use pac::gpio::vals::Moder;
         let gpio = pac::GPIOB;
+        let sda = self.sda;
         let half_bit = || cortex_m::asm::delay(CPU_MHZ * 5); // ~5 us: a 100 kHz clock
         let high = |pin: usize| gpio.idr().read().idr(pin) == pac::gpio::vals::Idr::HIGH;
         let release = |pin: usize| gpio.bsrr().write(|w| w.set_bs(pin, true));
@@ -194,14 +196,14 @@ impl NucleoSystem {
         pac::I2C1.cr1().modify(|w| w.set_pe(false));
         // The driver already set the pins to open drain; only the mode changes.
         release(I2C_SCL);
-        release(I2C_SDA);
+        release(sda);
         gpio.moder().modify(|w| {
             w.set_moder(I2C_SCL, Moder::OUTPUT);
-            w.set_moder(I2C_SDA, Moder::OUTPUT);
+            w.set_moder(sda, Moder::OUTPUT);
         });
         half_bit();
         for _ in 0..9 {
-            if high(I2C_SDA) {
+            if high(sda) {
                 break;
             }
             pull_low(I2C_SCL);
@@ -210,15 +212,15 @@ impl NucleoSystem {
             half_bit();
         }
         // STOP: SDA goes high while SCL is high.
-        pull_low(I2C_SDA);
+        pull_low(sda);
         half_bit();
-        release(I2C_SDA);
+        release(sda);
         half_bit();
-        let free = (high(I2C_SDA), high(I2C_SCL));
+        let free = (high(sda), high(I2C_SCL));
 
         gpio.moder().modify(|w| {
             w.set_moder(I2C_SCL, Moder::ALTERNATE);
-            w.set_moder(I2C_SDA, Moder::ALTERNATE);
+            w.set_moder(sda, Moder::ALTERNATE);
         });
         pac::I2C1.cr1().modify(|w| w.set_pe(true));
         Ok(free)
@@ -257,7 +259,11 @@ impl System for NucleoSystem {
     }
 
     fn i2c_pins(&self) -> Option<&'static str> {
-        Some("SDA PB9 = D14, SCL PB8 = D15, the two pins above AREF")
+        Some(if self.sda == 7 {
+            "SDA D14 = PB7, SCL D15 = PB8, the two pins above AREF"
+        } else {
+            "SDA D14 = PB9, SCL D15 = PB8, the two pins above AREF"
+        })
     }
 
     fn i2c_set_speed(&mut self, hz: u32) -> Result<u32, HwError> {
@@ -286,6 +292,17 @@ impl System for NucleoSystem {
         let r = self.i2c.blocking_write_read(addr, bytes, buf);
         self.i2c_result(r)
     }
+}
+
+/// Arduino D14 (SDA) is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P, and the
+/// two boards run the same firmware. An I2C module has pull-ups on its lines, so with the
+/// MCU's weaker pull-downs on both candidates, the one wired to the module reads high.
+/// With nothing attached both read low, and PB9 is the default. Returns the pin number.
+fn find_sda(pb7: Peri<'_, peripherals::PB7>, pb9: Peri<'_, peripherals::PB9>) -> usize {
+    let pb7 = Input::new(pb7, Pull::Down);
+    let pb9 = Input::new(pb9, Pull::Down);
+    cortex_m::asm::delay(CPU_MHZ * 20); // let the lines settle, ~20 us
+    if pb7.is_high() && pb9.is_low() { 7 } else { 9 }
 }
 
 fn read_reset_reason() -> &'static str {
@@ -393,8 +410,15 @@ async fn main(spawner: Spawner) {
     i2c_config.sda_pullup = true;
     i2c_config.scl_pullup = true;
     i2c_config.timeout = I2C_TIMEOUT;
-    let i2c = I2c::new_blocking(p.I2C1, p.PB8, p.PB9, i2c_config);
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c };
+    let (mut pb7, mut pb9) = (p.PB7, p.PB9);
+    let sda = find_sda(pb7.reborrow(), pb9.reborrow());
+    info!("I2C1 SDA on PB{}", sda);
+    let i2c = if sda == 7 {
+        I2c::new_blocking(p.I2C1, p.PB8, pb7, i2c_config)
+    } else {
+        I2c::new_blocking(p.I2C1, p.PB8, pb9, i2c_config)
+    };
+    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda };
 
     spawner.spawn(shell_task(sys, uart_rx, uart_tx, spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());

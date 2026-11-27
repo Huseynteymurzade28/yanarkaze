@@ -180,7 +180,10 @@ I2C1 is on the Arduino header, so an SSD1306 OLED (or any I2C sensor) plugs stra
 | GND      | GND (CN6 power header, or CN5 just below AREF)          |
 | VCC      | 3V3 (CN6 power header)                                  |
 | SCL      | D15 = PB8 (CN5, the top pin, above SDA)                 |
-| SDA      | D14 = PB9 (CN5, the second pin from the top)            |
+| SDA      | D14 (CN5, the second pin from the top)                  |
+
+D14 is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P; the firmware finds out at
+boot from the module's pull-ups, so attach the display before powering up.
 
 Then `i2c scan` should find the display at 0x3C, the logo appears at the next boot, and
 `oled dash`, `snake` and `2048` draw on it. I2C is blocking on this board (through DMA2,
