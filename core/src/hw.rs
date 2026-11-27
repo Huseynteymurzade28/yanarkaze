@@ -406,7 +406,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     /// Sends the whole framebuffer.
-    async fn oled_flush(&mut self) -> Result<(), HwError> {
+    pub(crate) async fn oled_flush(&mut self) -> Result<(), HwError> {
         self.oled_init().await?;
         self.oled_cmds(&oled::WINDOW).await?;
         let mut buf = [0u8; 1 + oled::WIDTH];

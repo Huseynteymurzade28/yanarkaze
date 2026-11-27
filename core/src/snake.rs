@@ -5,6 +5,8 @@
 
 use heapless::Deque;
 
+use crate::oled::{Display, CHAR_W};
+
 pub const W: u8 = 24;
 pub const H: u8 = 14;
 const CELLS: usize = W as usize * H as usize;
@@ -155,6 +157,52 @@ impl Game {
     }
 }
 
+/// Pixel size of one board cell on the OLED: 24x14 cells make a 96x56 board.
+const OLED_CELL: i32 = 4;
+const OLED_X: i32 = 1;
+const OLED_Y: i32 = 4;
+
+/// Draws the whole game on a 128x64 OLED: the board in a box on the left, the score and
+/// best on the right, and `banner` (e.g. "PAUSED") in a box over the board.
+pub fn render(game: &Game, best: u32, banner: Option<&str>, d: &mut Display) {
+    use core::fmt::Write;
+    d.clear();
+    let (bw, bh) = (W as i32 * OLED_CELL, H as i32 * OLED_CELL);
+    d.rect(OLED_X - 1, OLED_Y - 1, bw + 2, bh + 2);
+    let cell = |p: Pos| (OLED_X + p.x as i32 * OLED_CELL, OLED_Y + p.y as i32 * OLED_CELL);
+    for (i, p) in game.body().enumerate() {
+        let (x, y) = cell(p);
+        if i == 0 {
+            d.fill_rect(x, y, OLED_CELL, OLED_CELL, true);
+        } else {
+            // One pixel smaller, so the segments stay visible.
+            d.fill_rect(x, y, OLED_CELL - 1, OLED_CELL - 1, true);
+        }
+    }
+    // Food: a small plus, which reads differently from a body segment.
+    let (x, y) = cell(game.food());
+    d.fill_rect(x + 1, y, 2, OLED_CELL, true);
+    d.fill_rect(x, y + 1, OLED_CELL, 2, true);
+
+    let panel = OLED_X + bw + 3;
+    let mut n: heapless::String<12> = heapless::String::new();
+    d.text(panel, OLED_Y, "pts", 1);
+    let _ = write!(n, "{}", game.score());
+    d.text(panel, OLED_Y + 10, &n, 1);
+    d.text(panel, OLED_Y + 28, "best", 1);
+    n.clear();
+    let _ = write!(n, "{}", best.max(game.score()));
+    d.text(panel, OLED_Y + 38, &n, 1);
+
+    if let Some(text) = banner {
+        let w = text.chars().count() as i32 * CHAR_W as i32 + 8;
+        let (x, y) = (OLED_X + (bw - w) / 2, OLED_Y + bh / 2 - 8);
+        d.fill_rect(x, y, w, 16, false);
+        d.rect(x, y, w, 16);
+        d.text(x + 5, y + 4, text, 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +310,25 @@ mod tests {
         let head = 12 | (7 << 16);
         let game = Game::new(rng([head]));
         assert!(!game.body().any(|p| p == game.food()));
+    }
+
+    #[test]
+    fn renders_on_the_oled() {
+        let game = Game::new(rng([0]));
+        let mut d = Display::new();
+        render(&game, 7, None, &mut d);
+        // Head at (12, 7): a full 4x4 block.
+        let (hx, hy) = (1 + 12 * 4, 4 + 7 * 4);
+        assert!((0..4).all(|i| d.pixel(hx + i, hy + i)));
+        // Body segment at (11, 7) leaves its right column dark.
+        assert!(d.pixel(hx - 4, hy) && !d.pixel(hx - 1, hy));
+        // Food at (0, 0) is a plus: centre lit, corner dark.
+        assert!(d.pixel(2, 5) && !d.pixel(1, 4));
+        // The box around the board.
+        assert!(d.pixel(0, 3) && d.pixel(97, 60) && !d.pixel(98, 3));
+
+        let mut banner = Display::new();
+        render(&game, 7, Some("PAUSED"), &mut banner);
+        assert!(banner.count() != d.count());
     }
 }

@@ -442,6 +442,19 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(self.term, "\x1b[1;1H\x1b[1;32mSNAKE\x1b[0m  score {score:<4} best {best:<4} {note}\x1b[K");
     }
 
+    /// Mirrors the game on the OLED, if one answered at boot. A failed transfer turns the
+    /// mirror off for the rest of the game, so a loose wire never stops the game itself.
+    async fn snake_oled(&mut self, game: &Game, banner: Option<&str>, on: &mut bool) {
+        if !*on {
+            return;
+        }
+        snake::render(game, BEST_SNAKE.load(Ordering::Relaxed), banner, &mut self.oled);
+        if self.oled_flush().await.is_err() {
+            self.oled_ready = false;
+            *on = false;
+        }
+    }
+
     pub(crate) async fn cmd_snake(&mut self) {
         const BODY: &str = "\x1b[32m\u{2588}\u{2588}\x1b[0m";
         const HEAD: &str = "\x1b[1;92m\u{2588}\u{2588}\x1b[0m";
@@ -468,6 +481,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
         self.snake_cell(game.food(), FOOD).await;
         self.term.flush().await;
+        let mut on_oled = self.oled_ready;
+        self.snake_oled(&game, None, &mut on_oled).await;
 
         let previous_mode = current_led_mode();
         GAME_ACTIVE.store(true, Ordering::Relaxed); // the button pauses instead of cycling LED modes
@@ -494,7 +509,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                                 toggle_pause = true;
                                 continue;
                             }
-                            Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game "quit",
+                            Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game ("quit", "QUIT"),
                             _ => continue,
                         };
                         if !paused {
@@ -518,10 +533,11 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                                 tick = (tick - Duration::from_millis(5)).max(Duration::from_millis(70));
                             }
                         }
-                        Step::Crashed => break 'game "\x1b[1;31mGAME OVER\x1b[0m",
-                        Step::Won => break 'game "\x1b[1;33mYOU WIN!\x1b[0m",
+                        Step::Crashed => break 'game ("\x1b[1;31mGAME OVER\x1b[0m", "GAME OVER"),
+                        Step::Won => break 'game ("\x1b[1;33mYOU WIN!\x1b[0m", "YOU WIN!"),
                     }
                     self.term.flush().await;
+                    self.snake_oled(&game, None, &mut on_oled).await;
                     next_tick = Instant::now() + tick;
                 }
                 Either3::Third(_) => toggle_pause = true,
@@ -537,8 +553,11 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     next_tick = Instant::now() + tick;
                 }
                 self.term.flush().await;
+                self.snake_oled(&game, paused.then_some("PAUSED"), &mut on_oled).await;
             }
         };
+        let (outcome, banner) = outcome;
+        self.snake_oled(&game, Some(banner), &mut on_oled).await;
 
         GAME_ACTIVE.store(false, Ordering::Relaxed);
         set_led_mode(previous_mode);
