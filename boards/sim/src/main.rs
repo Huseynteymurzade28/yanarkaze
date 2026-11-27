@@ -249,6 +249,14 @@ static SIM_PINS: [PinInfo; 19] = {
 /// real chips so the drivers run end to end.
 const SIM_I2C: [u8; 4] = [0x3C, 0x76, 0x44, 0x38];
 
+/// Where the simulator keeps `save`d settings: $YANARKAZE_SETTINGS, or ~/.yanarkaze-settings.
+fn sim_settings_path() -> std::path::PathBuf {
+    match env::var_os("YANARKAZE_SETTINGS") {
+        Some(path) => path.into(),
+        None => env::home_dir().unwrap_or_default().join(".yanarkaze-settings"),
+    }
+}
+
 /// Slowly drifting fake room conditions: about 22-24 degC and 40-50 %RH.
 fn sim_room() -> (f32, f32) {
     let t = STARTED.get_or_init(Instant::now).elapsed().as_secs_f32();
@@ -393,6 +401,21 @@ impl System for SimSystem {
 
     fn i2c_recover(&mut self) -> Result<(bool, bool), HwError> {
         Ok((true, true))
+    }
+
+    fn settings_load(&mut self, buf: &mut [u8]) -> Result<(), HwError> {
+        buf.fill(0xFF); // like erased flash
+        if let Ok(data) = std::fs::read(sim_settings_path()) {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+        }
+        Ok(())
+    }
+
+    fn settings_store(&mut self, data: &[u8]) -> Result<(), HwError> {
+        let path = sim_settings_path();
+        let result = if data.is_empty() { std::fs::remove_file(&path).or(Ok(())) } else { std::fs::write(&path, data) };
+        result.map_err(|_| HwError::Bus)
     }
 
     async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {

@@ -230,6 +230,20 @@ pub trait System {
         Err(HwError::Unsupported)
     }
 
+    // -- Settings storage (aliases, autorun). Optional too.
+
+    /// Reads the stored settings into `buf` (the whole area; erased flash reads as 0xFF).
+    /// The shell checks the content itself, so this does not need to.
+    fn settings_load(&mut self, _buf: &mut [u8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Replaces the stored settings with `data` (at most `settings::BLOB_MAX` bytes); an
+    /// empty slice just erases them.
+    fn settings_store(&mut self, _data: &[u8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
     /// Blocks forever without yielding to the executor, so the watchdog fires.
     fn hang(&mut self) -> ! {
         loop {

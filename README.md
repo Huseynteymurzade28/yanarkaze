@@ -96,6 +96,11 @@ System:
   calc <expr>          calculator: 0xff & ~0x0f, 1 << 12, 7 / 2, (3 + 4) * 2
   repeat <n> <cmd>     run a command n times (any key stops)
   every <s> <cmd>      run a command every s seconds (any key stops)
+  alias [name cmd]     list aliases, or make one: alias hot alert 30; temp
+  unalias <name>       remove an alias
+  autorun [cmd|off]    a command line to run at boot
+  save                 keep the aliases and the autorun across reboots (in flash)
+  forget               erase the saved settings
   hang                 freeze the executor -> watchdog resets the system
   reboot               restart
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
@@ -109,6 +114,7 @@ Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   adc <pin> [watch]    read an analog pin in millivolts, e.g. a potentiometer
   knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16 (NUCLEO: knob A0 D3)
   i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
+  env [watch]          room temperature, humidity, pressure: BME280/BMP280, SHT3x, AHT20
   oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
                        | clear | invert | contrast <0-255> | on | off
 
@@ -141,6 +147,20 @@ Line editing keys:
 
 Commands can be chained with `;` (`led on; temp`), and `repeat` / `every` wrap one
 (`every 1 temp`, `repeat 5 roll d20`).
+
+Aliases name a command line, `;` and all, and take extra arguments at the end:
+
+```
+yanarkaze> alias hot alert 30; temp
+yanarkaze> alias hi echo hello
+yanarkaze> hi there                    -> hello there
+yanarkaze> autorun led heartbeat; oled dash
+yanarkaze> save                        -> kept in flash, loaded and run at the next boot
+```
+
+The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
+are stored on the NUCLEO (last flash page) and in the simulator (`~/.yanarkaze-settings`, or
+`$YANARKAZE_SETTINGS`); other boards keep them until reboot.
 
 `help` and tab completion are generated from the command tables in `core/src/shell.rs`; a
 test fails if a table entry has no handler.

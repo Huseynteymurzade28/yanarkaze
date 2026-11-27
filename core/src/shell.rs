@@ -17,6 +17,7 @@ use crate::state::{
     TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
 };
 use crate::term::Term;
+use crate::settings::{self, Settings};
 use crate::{VERSION, calc, fun, screens};
 
 const PROMPT: &str = "\x1b[1;38;5;208myanarkaze\x1b[0m\x1b[1;38;5;51m>\x1b[0m ";
@@ -65,6 +66,11 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     cmd("calc", "<expr>", "calculator: 0xff & ~0x0f, 1 << 12, 7 / 2, (3 + 4) * 2"),
     cmd("repeat", "<n> <cmd>", "run a command n times (any key stops)"),
     cmd("every", "<s> <cmd>", "run a command every s seconds (any key stops)"),
+    cmd("alias", "[name cmd]", "list aliases, or make one: alias hot alert 30; temp"),
+    cmd("unalias", "<name>", "remove an alias"),
+    Command { completions: &["off"], ..cmd("autorun", "[cmd|off]", "a command line to run at boot") },
+    cmd("save", "", "keep the aliases and the autorun across reboots (in flash)"),
+    cmd("forget", "", "erase the saved settings"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
     cmd("bootloader", "", "restart into the USB bootloader, ready for new firmware"),
@@ -236,6 +242,9 @@ pub(crate) fn chart_level(value: f32, lo: f32, hi: f32, row: usize, rows: usize)
     (eighths - row as i32 * 8).clamp(0, 8) as usize
 }
 
+/// Appended to messages about changes that only `save` makes permanent.
+const UNSAVED: &str = " (until reboot; 'save' keeps it)";
+
 const KEYS_HELP: &str = "Keys: Tab = complete, up/down = history, left/right/Home/End = move,\r\n      \
                          Ctrl+W/U/K = delete word/to start/to end, Ctrl+L = clear, Ctrl+C = cancel\r\n";
 
@@ -251,6 +260,7 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) oled: Display,
     pub(crate) oled_ready: bool,
     pub(crate) oled_inverted: bool,
+    pub(crate) settings: Settings,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -268,6 +278,7 @@ pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Sp
         oled: Display::new(),
         oled_ready: false,
         oled_inverted: false,
+        settings: Settings::default(),
     };
     shell.main_loop().await
 }
@@ -314,6 +325,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     async fn main_loop(&mut self) -> ! {
         self.oled_boot().await;
         self.banner().await;
+        self.load_settings().await;
         self.term.print(PROMPT).await;
         self.term.flush().await;
 
@@ -364,8 +376,49 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
-    /// Runs a command line: `;` separates commands, `repeat` and `every` wrap one.
+    /// Loads the saved settings and runs the autorun command, unless the watchdog just
+    /// reset the board: then the autorun may be what hung it, and running it again would
+    /// make a reset loop.
+    async fn load_settings(&mut self) {
+        let mut blob = [0u8; settings::BLOB_MAX];
+        if self.sys.settings_load(&mut blob).is_err() {
+            return; // no storage on this board
+        }
+        let Some(saved) = Settings::decode(&blob) else { return };
+        self.settings = saved;
+        let n = self.settings.aliases.len();
+        if n > 0 {
+            out!(self.term, "  {n} alias{} loaded ('alias' lists them)\r\n", if n == 1 { "" } else { "es" });
+        }
+        if self.settings.autorun.is_empty() {
+            return;
+        }
+        let reason = self.sys.reset_reason();
+        if reason.starts_with("watchdog") || reason.starts_with("window watchdog") {
+            self.term.print("  \x1b[1;33mautorun skipped\x1b[0m: the watchdog reset the board\r\n\r\n").await;
+            return;
+        }
+        let cmd: heapless::String<{ settings::BODY_LEN }> = self.settings.autorun.clone();
+        out!(self.term, "{PROMPT}{} \x1b[2m(autorun)\x1b[0m\r\n", cmd.as_str());
+        self.run_command(&cmd).await;
+    }
+
+    /// Runs a command line: aliases are filled in, `;` separates commands, `repeat` and
+    /// `every` wrap one.
     async fn run_command(&mut self, line: &str) {
+        // `alias` and `autorun` take the rest of the line as it is, `;` included: they
+        // store a command line rather than run one.
+        if matches!(split_word(line).0, "alias" | "autorun") {
+            self.run_single(line).await;
+            return;
+        }
+        let line = match settings::expand(line, &self.settings) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                out!(self.term, "error: {e}\r\n");
+                return;
+            }
+        };
         for part in line.split(';').map(str::trim).filter(|p| !p.is_empty()) {
             let (first, rest) = split_word(part);
             let (count, inner) = split_word(rest);
@@ -394,6 +447,67 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 },
                 _ => self.run_single(part).await,
             }
+        }
+    }
+
+    async fn cmd_alias(&mut self, rest: &str) {
+        let (name, body) = split_word(rest);
+        if name.is_empty() {
+            if self.settings.aliases.is_empty() {
+                self.term.print("no aliases. e.g.: alias hot alert 30; temp\r\n").await;
+            }
+            for i in 0..self.settings.aliases.len() {
+                let (n, b) = self.settings.aliases[i].clone();
+                out!(self.term, "  {:<16} {}\r\n", n.as_str(), b.as_str());
+            }
+            return;
+        }
+        if body.is_empty() {
+            match self.settings.alias(name) {
+                Some(b) => {
+                    let b: heapless::String<{ settings::BODY_LEN }> = b.try_into().unwrap_or_default();
+                    out!(self.term, "  {name:<16} {}\r\n", b.as_str());
+                }
+                None => out!(self.term, "no alias '{name}'. usage: alias <name> <command; command...>\r\n"),
+            }
+            return;
+        }
+        match self.settings.set_alias(name, body, |n| COMMAND_NAMES.contains(&n)) {
+            Ok(()) => out!(self.term, "alias '{name}' set{UNSAVED}\r\n"),
+            Err(e) => out!(self.term, "error: {e}\r\n"),
+        }
+    }
+
+    async fn cmd_autorun(&mut self, rest: &str) {
+        match rest.trim() {
+            "" if self.settings.autorun.is_empty() => {
+                self.term.print("no autorun. e.g.: autorun led heartbeat; oled dash\r\n").await
+            }
+            "" => {
+                let cmd = self.settings.autorun.clone();
+                out!(self.term, "at boot: {}\r\n", cmd.as_str());
+            }
+            "off" | "none" => {
+                self.settings.autorun.clear();
+                out!(self.term, "autorun off{UNSAVED}\r\n");
+            }
+            cmd => match self.settings.set_autorun(cmd) {
+                Ok(()) => out!(self.term, "at boot: {cmd}{UNSAVED}\r\n"),
+                Err(e) => out!(self.term, "error: {e}\r\n"),
+            },
+        }
+    }
+
+    async fn cmd_save(&mut self) {
+        let mut blob = [0u8; settings::BLOB_MAX];
+        let len = self.settings.encode(&mut blob);
+        match self.sys.settings_store(&blob[..len]) {
+            Ok(()) => {
+                let n = self.settings.aliases.len();
+                let autorun = if self.settings.autorun.is_empty() { "no autorun" } else { "an autorun" };
+                out!(self.term, "saved {n} alias(es) and {autorun} ({len} bytes)\r\n");
+            }
+            Err(e) => out!(self.term, "error: {e}\r\n"),
         }
     }
 
@@ -446,6 +560,18 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "knob" => self.cmd_knob(args).await,
             "i2c" => self.cmd_i2c(args).await,
             "env" => self.cmd_env(args).await,
+            "alias" => self.cmd_alias(rest).await,
+            "unalias" => match args.next() {
+                Some(name) if self.settings.remove_alias(name) => out!(self.term, "removed '{name}'{UNSAVED}\r\n"),
+                Some(name) => out!(self.term, "no alias '{name}'\r\n"),
+                None => self.term.print("usage: unalias <name>\r\n").await,
+            },
+            "autorun" => self.cmd_autorun(rest).await,
+            "save" => self.cmd_save().await,
+            "forget" => match self.sys.settings_store(&[]) {
+                Ok(()) => self.term.print("saved settings erased (the current ones stay until reboot)\r\n").await,
+                Err(e) => out!(self.term, "error: {e}\r\n"),
+            },
             "oled" => self.cmd_oled(rest).await,
             "calc" => self.cmd_calc(rest).await,
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.

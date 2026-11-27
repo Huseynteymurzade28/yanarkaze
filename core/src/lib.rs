@@ -23,6 +23,7 @@ mod hw;
 mod keys;
 mod oled;
 mod screens;
+pub mod settings;
 mod snake;
 mod state;
 
