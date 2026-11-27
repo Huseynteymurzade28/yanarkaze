@@ -2,15 +2,9 @@
   <img src="assets/logo.png" alt="yanarkaze logo: a flame and a gust of wind in a circle" width="200">
 </p>
 
-# yanarkaze
+<h1 align="center">yanarkaze</h1>
 
-```
-                              _
- _  _  __ _  _ _   __ _  _ _ | |__ __ _  ___  ___
-| || |/ _` || ' \ / _` || '_|| / // _` ||_ / / -_)
- \_, |\__,_||_||_|\__,_||_|  |_\_\\__,_|/__| \___|
- |__/
-```
+<p align="center"><em>A tiny async OS in Rust that keeps burning wherever the wind takes it.</em></p>
 
 **yanar** (Azerbaijani: *burning*, as in [Yanardag](https://en.wikipedia.org/wiki/Yanar_Dag), the
 mountain that has been on fire for millennia) + **kaze** (Japanese 風: *wind*).
