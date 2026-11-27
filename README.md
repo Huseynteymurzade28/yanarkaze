@@ -129,6 +129,7 @@ Files (ember, in flash: NUCLEO and the simulator):
   rm <file>...         delete files
   mv <file> <name>     rename a file
   df                   how much room the files take
+  format yes           erase every file and start ember afresh
   edit <file>          full-screen editor: arrows, Home/End, PgUp/PgDn; ^S saves, ^X quits
 
 Fun:
@@ -191,7 +192,7 @@ For `scope`, wire a PWM output to an analog pin: `pwm D3 25 1000; scope A0 20` s
 1 kHz square wave at 25 % duty (in the simulator, PWM output reaches every analog pin).
 
 Any command's output can go into a file: `echo hello > notes.txt` writes one, `temp >>
-notes.txt` adds to it. Files live in ember, a small flat file system in flash (96 KB on the
+notes.txt` adds to it. Files live in ember, a small flat file system in flash (160 KB on the
 NUCLEO, 32 files of up to 8 KB) on top of
 [sequential-storage](https://github.com/tweedegolf/sequential-storage), which spreads the
 wear and survives a reset in the middle of a write. Names start with a letter, so `calc 256

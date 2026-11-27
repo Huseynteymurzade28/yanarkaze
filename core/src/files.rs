@@ -131,6 +131,21 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
+    pub(crate) async fn cmd_format(&mut self, confirm: Option<&str>) {
+        if confirm != Some("yes") {
+            self.term.print("this erases every file. type 'format yes' to go ahead\r\n").await;
+            return;
+        }
+        let result = match ember(&mut self.sys) {
+            Ok(mut fs) => fs.format().await.map(|()| fs.capacity()),
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(capacity) => out!(self.term, "ember is empty and ready: {} KB of flash\r\n", capacity / 1024),
+            Err(e) => self.fs_error(e).await,
+        }
+    }
+
     pub(crate) async fn cmd_df(&mut self) {
         let result = match ember(&mut self.sys) {
             Ok(mut fs) => fs.list().await.map(|files| (files, fs.capacity())),

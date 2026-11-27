@@ -24,8 +24,9 @@ static_cell = "2.1.1"
 
 [profile.release]
 debug = 2
-# Size over speed: about 35 % smaller (250 KB instead of 380 KB), which leaves flash for the
-# file system, the log and the settings. mandel is the only thing that notices.
-opt-level = "s"
+# Size over speed: "z" makes the firmware about 40 % smaller than the default (235 KB rather
+# than 380 KB with the file system and editor), which leaves flash for 160 KB of files.
+# mandel is the only thing that notices.
+opt-level = "z"
 lto = "fat"
 codegen-units = 1

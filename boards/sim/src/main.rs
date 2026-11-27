@@ -265,14 +265,14 @@ fn sim_settings_path() -> std::path::PathBuf {
 }
 
 /// The flash areas, each a file of 2 KB pages, erased to 0xFF: the temperature log
-/// (16 pages, `$YANARKAZE_LOG` or `~/.yanarkaze-log`) and the files (48 pages,
+/// (16 pages, `$YANARKAZE_LOG` or `~/.yanarkaze-log`) and the files (80 pages,
 /// `$YANARKAZE_FILES` or `~/.yanarkaze-files`).
 const SIM_PAGE: usize = 2048;
 
 fn sim_area(area: Area) -> (usize, std::path::PathBuf) {
     let (pages, var, name) = match area {
         Area::Log => (16, "YANARKAZE_LOG", ".yanarkaze-log"),
-        Area::Files => (48, "YANARKAZE_FILES", ".yanarkaze-files"),
+        Area::Files => (80, "YANARKAZE_FILES", ".yanarkaze-files"),
     };
     let path = match env::var_os(var) {
         Some(path) => path.into(),

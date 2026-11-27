@@ -86,8 +86,10 @@ const SETTINGS_OFFSET: u32 = FLASH_SIZE as u32 - SETTINGS_PAGE;
 /// The temperature log: the 16 pages (32 KB, 4096 records) below the settings.
 const LOG_PAGES: u32 = 16;
 const LOG_OFFSET: u32 = SETTINGS_OFFSET - LOG_PAGES * SETTINGS_PAGE;
-/// The file system: the 48 pages (96 KB) below the log.
-const FILES_PAGES: u32 = 48;
+/// The file system: the 80 pages (160 KB) below the log. The firmware has to end below it,
+/// at 318 KB; `flash_area` refuses the area if it ever grows that far. Moving this start
+/// loses the files, so it stays put.
+const FILES_PAGES: u32 = 80;
 const FILES_OFFSET: u32 = LOG_OFFSET - FILES_PAGES * SETTINGS_PAGE;
 
 /// Where the firmware image ends in flash: the initial values of `.data` are its last part.

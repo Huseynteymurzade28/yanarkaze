@@ -117,6 +117,7 @@ pub(crate) const FILE_COMMANDS: &[Command] = &[
     cmd("mv", "<file> <name>", "rename a file"),
     cmd("df", "", "how much room the files take"),
     cmd("edit", "<file>", "full-screen editor: arrows move, ^S saves, ^X quits"),
+    cmd("format", "yes", "erase every file and start ember afresh"),
 ];
 
 pub(crate) const FUN_COMMANDS: &[Command] = &[
@@ -791,6 +792,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "mv" => self.cmd_mv(args).await,
             "df" => self.cmd_df().await,
             "edit" => self.cmd_edit(args).await,
+            "format" => self.cmd_format(args.next()).await,
             "sleep" => self.cmd_sleep().await,
             "log" => self.cmd_log(args).await,
             "scope" => self.cmd_scope(args).await,
@@ -968,11 +970,14 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 Wake::Button => {
                     let _ = select(BUTTON_SIGNAL.wait(), Timer::after_millis(200)).await;
                 }
-                // The UART woke up in the middle of that key: drop whatever garbage it made.
+                // The UART woke up in the middle of that key (and the clocks were still slow
+                // for a moment): drop the garbage and the errors it made, until it has been
+                // quiet for 50 ms.
                 Wake::Key => {
-                    let mut buf = [0u8; 8];
-                    while let Either::First(Ok(n)) = select(self.rx.read(&mut buf), Timer::after_millis(20)).await {
-                        if n == 0 {
+                    let mut buf = [0u8; 16];
+                    let give_up = Instant::now() + embassy_time::Duration::from_millis(500);
+                    while Instant::now() < give_up {
+                        if let Either::Second(()) = select(self.rx.read(&mut buf), Timer::after_millis(50)).await {
                             break;
                         }
                     }

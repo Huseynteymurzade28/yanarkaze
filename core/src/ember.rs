@@ -47,6 +47,8 @@ pub enum FsError {
     Full,
     TooManyFiles,
     Flash,
+    /// The map in flash does not add up; `format yes` starts afresh.
+    Damaged,
     /// The board has no flash for files.
     Unsupported,
 }
@@ -60,6 +62,7 @@ impl fmt::Display for FsError {
             FsError::Full => "no room left in flash",
             FsError::TooManyFiles => "too many files (32 at most)",
             FsError::Flash => "the flash did not answer",
+            FsError::Damaged => "the file area looks damaged ('format yes' erases it and starts afresh)",
             FsError::Unsupported => "this board has no flash for files",
         })
     }
@@ -69,6 +72,7 @@ impl<E> From<sequential_storage::Error<E>> for FsError {
     fn from(e: sequential_storage::Error<E>) -> Self {
         match e {
             sequential_storage::Error::FullStorage => FsError::Full,
+            sequential_storage::Error::Corrupted { .. } => FsError::Damaged,
             _ => FsError::Flash,
         }
     }
