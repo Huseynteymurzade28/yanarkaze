@@ -1,0 +1,243 @@
+//! Whole-screen pictures for the OLED, each a pure function of its data so it can be unit
+//! tested (and previewed in a test as ASCII art). The shell gathers the data and flushes.
+
+use core::f32::consts::PI;
+use core::fmt::Write;
+
+use heapless::String;
+
+use crate::oled::{CHAR_W, Display, HEIGHT, WIDTH};
+
+/// Draws `text` with the bar behind it in inverse video, across the top 10 rows.
+fn header(d: &mut Display, text: &str) {
+    d.text(2, 1, text, 1);
+    d.invert_rect(0, 0, WIDTH as i32, 10);
+}
+
+/// Draws `text` right-aligned so that it ends at `right` (exclusive).
+fn text_right(d: &mut Display, right: i32, y: i32, text: &str) {
+    let w = text.chars().count() as i32 * CHAR_W as i32 - 1;
+    d.text(right - w, y, text, 1);
+}
+
+// ---------------------------------------------------------------------------
+// top
+// ---------------------------------------------------------------------------
+
+/// One line of the `top` screen. `per_sec` is `None` before there is an interval to measure.
+pub struct TopRow<'a> {
+    pub name: &'a str,
+    pub per_sec: Option<u32>,
+}
+
+/// Blocks in a task's activity bar: 1, 2, 4, 8, ... wakeups per second each add one,
+/// like the terminal version, so a task waking 1000 times a second does not drown the rest.
+pub fn activity_blocks(per_sec: u32) -> u32 {
+    32 - per_sec.leading_zeros()
+}
+
+/// The `top` screen: uptime in the header, then one row per task with its name, an
+/// activity bar and its wakeups per second.
+pub fn top(d: &mut Display, uptime_s: u64, rows: &[TopRow]) {
+    d.clear();
+    let mut line: String<24> = String::new();
+    let _ = write!(line, "top  up {:02}:{:02}:{:02}", uptime_s / 3600, (uptime_s / 60) % 60, uptime_s % 60);
+    header(d, &line);
+    // Columns: name (8 characters), bar (11 blocks of 5 pixels), rate (4 characters).
+    const BAR_X: i32 = 48;
+    const BLOCK: i32 = 5;
+    for (i, row) in rows.iter().take(5).enumerate() {
+        let y = 13 + i as i32 * 10;
+        d.text(0, y, row.name.get(..8).unwrap_or(row.name), 1);
+        line.clear();
+        match row.per_sec {
+            Some(rate) => {
+                for b in 0..activity_blocks(rate).min(11) as i32 {
+                    d.fill_rect(BAR_X + b * BLOCK, y, BLOCK - 1, 7, true);
+                }
+                let _ = write!(line, "{}", rate.min(9999));
+            }
+            None => {
+                let _ = line.push('-');
+            }
+        }
+        text_right(d, WIDTH as i32, y, &line);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mandel
+// ---------------------------------------------------------------------------
+
+pub const MANDEL_MAX_ITER: u32 = 64;
+
+/// 4x4 ordered-dither thresholds (0..16): turns a brightness into a dot pattern.
+const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// Renders rows `rows` of the Mandelbrot set into the framebuffer (the caller yields to the
+/// executor between batches). Inside the set is solid; outside, the closer a point comes to
+/// the set (the more iterations it takes to escape), the denser the dither. Returns the
+/// number of iterations computed, for the speed report.
+pub fn mandel_rows(d: &mut Display, rows: core::ops::Range<usize>) -> u64 {
+    // Square pixels: 64 rows span -1.1..1.1, which centres the set horizontally.
+    const SCALE: f32 = 2.2 / HEIGHT as f32;
+    const LEFT: f32 = -0.75 - SCALE * WIDTH as f32 / 2.0;
+    let mut iterations = 0u64;
+    for y in rows {
+        let ci = -1.1 + SCALE * (y as f32 + 0.5);
+        for x in 0..WIDTH {
+            let cr = LEFT + SCALE * (x as f32 + 0.5);
+            let (mut zr, mut zi, mut n) = (0.0f32, 0.0f32, 0u32);
+            while n < MANDEL_MAX_ITER && zr * zr + zi * zi <= 4.0 {
+                let t = zr * zr - zi * zi + cr;
+                zi = 2.0 * zr * zi + ci;
+                zr = t;
+                n += 1;
+            }
+            iterations += n as u64;
+            let on = if n == MANDEL_MAX_ITER {
+                true
+            } else {
+                // Escape bands: 2-3 iterations is sparse, 16+ is nearly solid.
+                let level = (n.saturating_sub(2) * 16 / 14).min(16) as u8;
+                level > BAYER[y % 4][x % 4]
+            };
+            d.set(x as i32, y as i32, on);
+        }
+    }
+    iterations
+}
+
+// ---------------------------------------------------------------------------
+// gauge
+// ---------------------------------------------------------------------------
+
+/// sin(x) for x in [-PI, PI], Bhaskara I's approximation: error under 0.002, plenty for
+/// pixels, and no libm needed.
+fn sin(x: f32) -> f32 {
+    let (sign, x) = if x < 0.0 { (-1.0, -x) } else { (1.0, x) };
+    let p = x * (PI - x);
+    sign * 16.0 * p / (5.0 * PI * PI - 4.0 * p)
+}
+
+/// cos(x) for x in [0, PI].
+fn cos(x: f32) -> f32 {
+    sin(PI / 2.0 - x)
+}
+
+/// A half-circle dial: `fraction` 0.0 points the needle left, 1.0 right. `value` goes big
+/// under the dial's centre, `label` (keep it to 6 characters) small in the bottom left.
+pub fn gauge(d: &mut Display, label: &str, value: &str, fraction: f32) {
+    d.clear();
+    let (cx, cy, r) = (64.0f32, 40.0f32, 38.0f32);
+    let point = |angle: f32, radius: f32| ((cx + radius * cos(angle)) as i32, (cy - radius * sin(angle)) as i32);
+    // The arc, one step per degree.
+    for step in 0..=180 {
+        let (x, y) = point(step as f32 * PI / 180.0, r);
+        d.set(x, y, true);
+    }
+    // Ticks every 10 %, longer at 0, 50 and 100 %.
+    for i in 0..=10 {
+        let angle = PI - i as f32 * PI / 10.0;
+        let inner = if i % 5 == 0 { r - 7.0 } else { r - 4.0 };
+        let (x0, y0) = point(angle, inner);
+        let (x1, y1) = point(angle, r);
+        d.line(x0, y0, x1, y1);
+    }
+    let angle = PI - fraction.clamp(0.0, 1.0) * PI;
+    let (nx, ny) = point(angle, r - 10.0);
+    d.line(cx as i32, cy as i32, nx, ny);
+    d.fill_rect(cx as i32 - 2, cy as i32 - 2, 5, 5, true); // the hub
+    d.text(0, HEIGHT as i32 - 8, label, 1);
+    let w = value.chars().count() as i32 * CHAR_W as i32 * 2 - 2;
+    d.text((WIDTH as i32 - w) / 2, HEIGHT as i32 - 15, value, 2);
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+
+    /// The whole screen as ASCII art, for eyeballing with `--nocapture`.
+    #[allow(dead_code)]
+    fn ascii(d: &Display) -> std::string::String {
+        let mut s = std::string::String::new();
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                s.push(if d.pixel(x, y) { '#' } else { '.' });
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn trig_is_close_enough() {
+        for i in 0..=36 {
+            let x = -PI + i as f32 * PI / 18.0;
+            let exact = std::primitive::f32::sin(x);
+            assert!((sin(x) - exact).abs() < 0.002, "sin({x})");
+        }
+        assert!((cos(0.0) - 1.0).abs() < 0.002 && (cos(PI) + 1.0).abs() < 0.002);
+    }
+
+    #[test]
+    fn activity_is_logarithmic() {
+        assert_eq!(activity_blocks(0), 0);
+        assert_eq!(activity_blocks(1), 1);
+        assert_eq!(activity_blocks(3), 2);
+        assert_eq!(activity_blocks(1000), 10);
+    }
+
+    #[test]
+    fn top_draws_a_row_per_task() {
+        let mut d = Display::new();
+        let rows = [TopRow { name: "shell", per_sec: Some(0) }, TopRow { name: "led", per_sec: Some(1000) }];
+        top(&mut d, 3725, &rows);
+        assert!(d.pixel(0, 0)); // inverse header
+        // The idle shell has no bar; the busy LED task has ten blocks.
+        assert!(!d.pixel(48, 13));
+        assert!(d.pixel(48, 23) && d.pixel(48 + 9 * 5, 23) && !d.pixel(48 + 10 * 5, 23));
+    }
+
+    #[test]
+    fn mandel_is_solid_inside_and_empty_far_out() {
+        let mut d = Display::new();
+        let n = mandel_rows(&mut d, 0..HEIGHT);
+        assert!(n > 0);
+        assert!(d.pixel(WIDTH / 2, HEIGHT / 2)); // c = -0.75 + 0i is in the set
+        assert!(!d.pixel(0, 0) && !d.pixel(WIDTH - 1, HEIGHT - 1));
+    }
+
+    #[test]
+    fn gauge_needle_follows_the_value() {
+        let mut left = Display::new();
+        gauge(&mut left, "", "", 0.0);
+        let mut right = Display::new();
+        gauge(&mut right, "", "", 1.0);
+        // Needle along the horizontal radius: left half lit for 0 %, right half for 100 %.
+        assert!(left.pixel(45, 40) && !left.pixel(83, 40));
+        assert!(right.pixel(83, 40) && !right.pixel(45, 40));
+    }
+
+    #[test]
+    #[ignore = "prints the screens; run with --ignored --nocapture"]
+    fn preview() {
+        let mut d = Display::new();
+        let rows = [
+            TopRow { name: "shell", per_sec: Some(3) },
+            TopRow { name: "led", per_sec: Some(40) },
+            TopRow { name: "button", per_sec: Some(0) },
+            TopRow { name: "sensor", per_sec: Some(1) },
+            TopRow { name: "watchdog", per_sec: Some(2) },
+        ];
+        top(&mut d, 3725, &rows);
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        mandel_rows(&mut d, 0..HEIGHT);
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        gauge(&mut d, "PA0 knob", "62%", 0.62);
+        std::println!("{}", ascii(&d));
+    }
+}

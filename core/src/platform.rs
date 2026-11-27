@@ -83,6 +83,15 @@ pub enum Pull {
     Down,
 }
 
+/// How a board names its pins; the shell parses and prints pin numbers this way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinStyle {
+    /// `GP16`: the number is the GPIO number (Raspberry Pi Pico).
+    Gp,
+    /// `PA5`: the number is port * 16 + bit, so PA5 is 5 and PB3 is 19 (STM32).
+    Port,
+}
+
 /// What a header pin can do, for the `pins` command.
 #[derive(Clone, Copy, Debug)]
 pub struct PinInfo {
@@ -154,6 +163,16 @@ pub trait System {
 
     /// The header pins the shell may use.
     fn pins(&self) -> &[PinInfo] {
+        &[]
+    }
+
+    /// How this board names its pins.
+    fn pin_style(&self) -> PinStyle {
+        PinStyle::Gp
+    }
+
+    /// Other names users may type for pins, such as Arduino header labels: `("A0", 0)`.
+    fn pin_aliases(&self) -> &[(&'static str, u8)] {
         &[]
     }
 

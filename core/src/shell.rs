@@ -17,7 +17,7 @@ use crate::state::{
     TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
 };
 use crate::term::Term;
-use crate::{VERSION, calc, fun};
+use crate::{VERSION, calc, fun, screens};
 
 const PROMPT: &str = "\x1b[1;38;5;208myanarkaze\x1b[0m\x1b[1;38;5;51m>\x1b[0m ";
 
@@ -576,8 +576,10 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             *prev = stat.wakeups();
         }
         let mut last = Instant::now();
+        let mut on_oled = self.oled_ready;
         self.term.print("\x1b[2J\x1b[?25l").await;
         for frame in 0u32.. {
+            let mut rates = [None; STATS.len()];
             let (h, m, s, _) = uptime_parts();
             let elapsed_ms = last.elapsed().as_millis().max(1);
             last = Instant::now();
@@ -596,7 +598,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 BUTTON_PRESSES.load(Ordering::Relaxed)
             );
             out!(t, "\x1b[7m  {:<10} {:>10} {:>8}  {:<22}\x1b[0m\r\n", "TASK", "WAKEUPS", "PER SEC", "ACTIVITY");
-            for (prev, stat) in previous.iter_mut().zip(STATS.iter()) {
+            for ((prev, stat), rate_out) in previous.iter_mut().zip(STATS.iter()).zip(rates.iter_mut()) {
                 let now = stat.wakeups();
                 let delta = now.wrapping_sub(*prev);
                 *prev = now;
@@ -606,6 +608,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     let _ = rate.push('-'); // no interval to measure yet
                 } else {
                     let _ = write!(rate, "{per_sec}");
+                    *rate_out = Some(per_sec.min(u32::MAX as u64) as u32);
                 }
                 // Log-ish bar: 1, 2, 4, 8, ... wakeups per second each add one block.
                 let mut bar: String<64> = String::new();
@@ -627,6 +630,15 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             out!(t, "  {:<10} {:>10} {:>8}  {}/{} running\x1b[K\r\n", "countdown", "-", "-", timers, fun::TIMER_SLOTS);
             out!(t, "\x1b[K\r\n\x1b[2many key stops\x1b[0m\x1b[K");
             self.term.flush().await;
+            if on_oled {
+                let rows: heapless::Vec<screens::TopRow, { STATS.len() }> = STATS
+                    .iter()
+                    .zip(rates)
+                    .map(|(stat, per_sec)| screens::TopRow { name: stat.name, per_sec })
+                    .collect();
+                screens::top(&mut self.oled, h * 3600 + m * 60 + s, &rows);
+                self.oled_mirror(&mut on_oled).await;
+            }
             if self.key_or_timeout(REFRESH_MS).await {
                 break;
             }

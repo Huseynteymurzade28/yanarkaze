@@ -180,6 +180,28 @@ impl Display {
         }
     }
 
+    /// A straight line from (x0, y0) to (x1, y1), both ends included (Bresenham).
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+        let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+        let (mut x, mut y, mut err) = (x0, y0, dx + dy);
+        loop {
+            self.set(x, y, true);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
     /// Flips every pixel in the rectangle: text drawn first becomes inverse video.
     pub fn invert_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
         for yy in y..y + h {
@@ -413,6 +435,20 @@ mod tests {
         assert!(!d.pixel(3, 1)); // the stroke of the 'I' is dark
         assert!(!d.pixel(10, 0)); // outside the rectangle untouched
         assert_eq!(d.count(), 100 - 7 - 2 * 2); // 'I': 7-pixel stem plus 2-pixel serifs top and bottom
+    }
+
+    #[test]
+    fn lines() {
+        let mut d = Display::new();
+        d.line(0, 0, 4, 4);
+        assert!((0..5).all(|i| d.pixel(i, i)) && d.count() == 5);
+        let mut d = Display::new();
+        d.line(10, 3, 2, 3); // right to left
+        assert_eq!(d.count(), 9);
+        let mut d = Display::new();
+        d.line(0, 0, 8, 2); // shallow: one pixel per column
+        assert_eq!(d.count(), 9);
+        assert!(d.pixel(0, 0) && d.pixel(8, 2));
     }
 
     #[test]

@@ -21,6 +21,7 @@ mod game2048;
 mod hw;
 mod keys;
 mod oled;
+mod screens;
 mod snake;
 mod state;
 
@@ -31,7 +32,9 @@ pub mod sensor;
 pub mod shell;
 pub mod watchdog;
 
-pub use platform::{BoardInfo, Button, HwError, Led, MemRegion, PinInfo, Pull, Reading, Sensor, System, Watchdog};
+pub use platform::{
+    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull, Reading, Sensor, System, Watchdog,
+};
 
 /// Version of the core, shown by `info`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -267,6 +267,16 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             self.term.print(&line).await;
         }
 
+        // The same set at 128x64 on the OLED, in batches so the other tasks keep running.
+        let mut on_oled = self.oled_ready;
+        if on_oled {
+            for top in (0..crate::oled::HEIGHT).step_by(8) {
+                crate::screens::mandel_rows(&mut self.oled, top..top + 8);
+                embassy_futures::yield_now().await;
+            }
+            self.oled_mirror(&mut on_oled).await;
+        }
+
         let info = self.sys.info();
         let float = if info.fpu { "hardware FPU" } else { "software floats (no FPU)" };
         match (self.sys.cycle_counter(), info.cpu_mhz) {

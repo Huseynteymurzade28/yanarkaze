@@ -9,15 +9,39 @@ use embedded_io_async::{Read, Write};
 use heapless::String;
 
 use crate::oled;
-use crate::platform::{HwError, Pull, System};
+use crate::platform::{HwError, PinStyle, Pull, System};
 use crate::shell::Shell;
 use crate::state::{BUTTON_PRESSES, HISTORY_SECS, SAMPLE, TEMP_HISTORY, current_led_mode};
 use portable_atomic::Ordering;
 
-/// Accepts `16`, `gp16` and `GP16`.
-pub(crate) fn parse_pin(s: &str) -> Option<u8> {
-    let digits = s.strip_prefix("gp").or_else(|| s.strip_prefix("GP")).unwrap_or(s);
-    digits.parse().ok()
+/// Parses a pin the way the board names them: one of its `aliases` (any case, e.g. `a0`),
+/// or `16` / `gp16` / `GP16` for [`PinStyle::Gp`], or `PA5` / `pa5` for [`PinStyle::Port`].
+pub(crate) fn parse_pin(style: PinStyle, aliases: &[(&str, u8)], s: &str) -> Option<u8> {
+    if let Some(&(_, pin)) = aliases.iter().find(|(name, _)| name.eq_ignore_ascii_case(s)) {
+        return Some(pin);
+    }
+    match style {
+        PinStyle::Gp => {
+            let digits = s.strip_prefix("gp").or_else(|| s.strip_prefix("GP")).unwrap_or(s);
+            digits.parse().ok()
+        }
+        PinStyle::Port => {
+            let rest = s.strip_prefix(['P', 'p'])?;
+            let port = rest.chars().next()?.to_ascii_uppercase();
+            let bit: u8 = rest.get(1..)?.parse().ok()?;
+            (('A'..='H').contains(&port) && bit < 16).then(|| (port as u8 - b'A') * 16 + bit)
+        }
+    }
+}
+
+/// The name of a pin, the way the board writes it: `GP16` or `PA5`.
+pub(crate) fn pin_name(style: PinStyle, pin: u8) -> String<6> {
+    let mut s = String::new();
+    let _ = match style {
+        PinStyle::Gp => write!(s, "GP{pin}"),
+        PinStyle::Port => write!(s, "P{}{}", (b'A' + pin / 16) as char, pin % 16),
+    };
+    s
 }
 
 /// Accepts `0x3c`, `3c` and `60`. I2C addresses are conventionally written in hex, so a bare
@@ -68,8 +92,13 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(self.term, "error: {e}\r\n");
     }
 
+    fn pin_name(&self, pin: u8) -> String<6> {
+        pin_name(self.sys.pin_style(), pin)
+    }
+
     async fn pin_arg(&mut self, arg: Option<&str>, usage: &str) -> Option<u8> {
-        match arg.and_then(parse_pin) {
+        let (style, aliases) = (self.sys.pin_style(), self.sys.pin_aliases());
+        match arg.and_then(|a| parse_pin(style, aliases, a)) {
             Some(pin) => Some(pin),
             None => {
                 out!(self.term, "usage: {usage}\r\n");
@@ -92,7 +121,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(self.term, "  {:<6} {:<5} {:<4} {:<4} {}\r\n", "PIN", "GPIO", "PWM", "ADC", "NOTE");
         for (pin, gpio, pwm, adc, note) in rows {
             let yes = |b: bool| if b { "yes" } else { "-" };
-            out!(self.term, "  GP{pin:<4} {:<5} {:<4} {:<4} {note}\r\n", yes(gpio), yes(pwm), yes(adc));
+            let name = self.pin_name(pin);
+            out!(self.term, "  {:<6} {:<5} {:<4} {:<4} {note}\r\n", name.as_str(), yes(gpio), yes(pwm), yes(adc));
         }
         let reserved = self.sys.reserved_pins();
         let i2c = self.sys.i2c_pins();
@@ -114,6 +144,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     pub(crate) async fn cmd_gpio<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         const USAGE: &str = "gpio <pin> on | off | toggle | read [up | down]";
         let Some(pin) = self.pin_arg(args.next(), USAGE).await else { return };
+        let name = self.pin_name(pin);
         let bit = 1u64 << (pin % 64);
         let result = match args.next().unwrap_or("read") {
             "on" | "high" | "1" => self.sys.gpio_write(pin, true).map(|()| Some(true)),
@@ -135,7 +166,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                             Pull::Up => " (pull-up)",
                             Pull::Down => " (pull-down)",
                         };
-                        out!(self.term, "GP{pin} = {}{pulled}\r\n", if high { "1 (high)" } else { "0 (low)" });
+                        out!(self.term, "{name} = {}{pulled}\r\n", if high { "1 (high)" } else { "0 (low)" });
                         return;
                     }
                     Err(e) => Err(e),
@@ -153,7 +184,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 } else {
                     self.gpio_levels &= !bit;
                 }
-                out!(self.term, "GP{pin} -> {}\r\n", if high { "high" } else { "low" });
+                out!(self.term, "{name} -> {}\r\n", if high { "high" } else { "low" });
             }
             Ok(None) => {}
             Err(e) => self.hw_error(e).await,
@@ -163,11 +194,12 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     pub(crate) async fn cmd_pwm<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         const USAGE: &str = "pwm <pin> <0-100 %> [hz]   or   pwm <pin> off";
         let Some(pin) = self.pin_arg(args.next(), USAGE).await else { return };
+        let name = self.pin_name(pin);
         let level = args.next();
         if level == Some("off") {
             let result = self.sys.pwm_set(pin, 1000, 0).and_then(|_| self.sys.gpio_write(pin, false));
             match result {
-                Ok(()) => out!(self.term, "GP{pin} pwm off\r\n"),
+                Ok(()) => out!(self.term, "{name} pwm off\r\n"),
                 Err(e) => self.hw_error(e).await,
             }
             return;
@@ -182,7 +214,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             return;
         }
         match self.sys.pwm_set(pin, hz, (percent * 10.0) as u16) {
-            Ok(actual) => out!(self.term, "GP{pin} pwm {percent:.1}% at {actual} Hz\r\n"),
+            Ok(actual) => out!(self.term, "{name} pwm {percent:.1}% at {actual} Hz\r\n"),
             Err(e) => self.hw_error(e).await,
         }
     }
@@ -194,7 +226,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             self.hw_error(e).await;
             return;
         }
-        out!(self.term, "GP{pin} breathing, one breath every {period} ms (any key stops)\r\n");
+        let name = self.pin_name(pin);
+        out!(self.term, "{name} breathing, one breath every {period} ms (any key stops)\r\n");
         self.term.flush().await;
         const STEPS: u32 = 50;
         'outer: loop {
@@ -212,15 +245,16 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     pub(crate) async fn cmd_adc<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         let Some(pin) = self.pin_arg(args.next(), "adc <pin> [watch]").await else { return };
         let watch = args.next() == Some("watch");
+        let name = self.pin_name(pin);
         if watch {
-            out!(self.term, "GP{pin} live (any key stops)\r\n");
+            out!(self.term, "{name} live (any key stops)\r\n");
         }
         loop {
             match self.sys.adc_read(pin).await {
                 Ok(mv) => {
                     let b = bar(mv as f32 / 3300.0, 40);
                     let end = if watch { "\x1b[K" } else { "\r\n" };
-                    out!(self.term, "\rGP{pin}: {mv:4} mV  {:3}%  {}{end}", mv * 100 / 3300, b.as_str());
+                    out!(self.term, "\r{name}: {mv:4} mV  {:3}%  {}{end}", mv * 100 / 3300, b.as_str());
                 }
                 Err(e) => {
                     self.hw_error(e).await;
@@ -237,10 +271,14 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     pub(crate) async fn cmd_knob<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
-        const USAGE: &str = "knob <adc pin> <pwm pin>   e.g. knob 26 16";
+        const USAGE: &str = "knob <adc pin> <pwm pin>   (see 'pins')";
         let Some(adc) = self.pin_arg(args.next(), USAGE).await else { return };
         let Some(pwm) = self.pin_arg(args.next(), USAGE).await else { return };
-        out!(self.term, "turn the knob on GP{adc}: it sets the brightness on GP{pwm} (any key stops)\r\n");
+        let (adc_name, pwm_name) = (self.pin_name(adc), self.pin_name(pwm));
+        out!(self.term, "turn the knob on {adc_name}: it sets the brightness on {pwm_name} (any key stops)\r\n");
+        // The OLED shows a dial; it only needs redrawing when the reading moves.
+        let mut on_oled = self.oled_ready;
+        let mut shown = u32::MAX;
         loop {
             let mv = match self.sys.adc_read(adc).await {
                 Ok(mv) => mv,
@@ -256,6 +294,13 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
             let b = bar(percent as f32 / 100.0, 40);
             out!(self.term, "\r  {mv:4} mV -> {percent:3}%  {}\x1b[K", b.as_str());
+            if on_oled && percent != shown {
+                shown = percent;
+                let mut value: String<8> = String::new();
+                let _ = write!(value, "{percent}%");
+                crate::screens::gauge(&mut self.oled, &adc_name, &value, percent as f32 / 100.0);
+                self.oled_mirror(&mut on_oled).await;
+            }
             if self.key_or_timeout(30).await {
                 break;
             }
@@ -661,10 +706,22 @@ mod tests {
 
     #[test]
     fn pins_and_addresses() {
-        assert_eq!(parse_pin("16"), Some(16));
-        assert_eq!(parse_pin("GP16"), Some(16));
-        assert_eq!(parse_pin("gp3"), Some(3));
-        assert_eq!(parse_pin("x"), None);
+        let gp = |s| parse_pin(PinStyle::Gp, &[], s);
+        assert_eq!(gp("16"), Some(16));
+        assert_eq!(gp("GP16"), Some(16));
+        assert_eq!(gp("gp3"), Some(3));
+        assert_eq!(gp("x"), None);
+        let port = |s| parse_pin(PinStyle::Port, &[("A0", 0), ("D3", 19)], s);
+        assert_eq!(port("PA5"), Some(5));
+        assert_eq!(port("pb3"), Some(19));
+        assert_eq!(port("PC13"), Some(45));
+        assert_eq!(port("a0"), Some(0));
+        assert_eq!(port("D3"), Some(19));
+        assert_eq!(port("PA16"), None);
+        assert_eq!(port("PZ1"), None);
+        assert_eq!(port("5"), None);
+        assert_eq!(pin_name(PinStyle::Port, 45), "PC13");
+        assert_eq!(pin_name(PinStyle::Gp, 16), "GP16");
         assert_eq!(parse_addr("0x3c"), Some(0x3C));
         assert_eq!(parse_addr("3c"), Some(0x3C));
         assert_eq!(parse_addr("60"), Some(60));
