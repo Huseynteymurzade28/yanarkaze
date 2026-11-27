@@ -36,7 +36,7 @@ pub mod shell;
 pub mod watchdog;
 
 pub use platform::{
-    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull, Reading, Sensor, System, Watchdog,
+    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull, Reading, Sensor, Slept, System, Wake, Watchdog,
 };
 
 /// Version of the core, shown by `info`.

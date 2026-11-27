@@ -73,6 +73,7 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
         ..cmd("log", "[start|show|csv]", "temperature log in flash: log start 5m, log show, log csv")
     },
     cmd("menu", "", "use the board without a computer: OLED menu, tap the button = next, hold = run"),
+    cmd("sleep", "", "deep sleep until the button or a key; 'info' shows the power estimate"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
     cmd("bootloader", "", "restart into the USB bootloader, ready for new firmware"),
@@ -278,6 +279,9 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) log_due: Option<Instant>,
     pub(crate) log_since_boot: bool,
     pub(crate) log_room: Option<crate::env::Found>,
+    /// Deep sleeps since boot, and the seconds spent in them.
+    sleeps: u32,
+    sleep_secs: u64,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -302,6 +306,8 @@ pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Sp
         log_due: None,
         log_since_boot: false,
         log_room: None,
+        sleeps: 0,
+        sleep_secs: 0,
     };
     shell.main_loop().await
 }
@@ -547,6 +553,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         add("life", "oled life");
         add("dashboard", "oled dash");
         add("logo", "oled logo");
+        add("sleep", "sleep");
         add("exit", "");
 
         let mut on_oled = self.oled_init().await.is_ok();
@@ -761,6 +768,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "i2c" => self.cmd_i2c(args).await,
             "env" => self.cmd_env(args).await,
             "plot" => self.cmd_plot(args).await,
+            "sleep" => self.cmd_sleep().await,
             "log" => self.cmd_log(args).await,
             "scope" => self.cmd_scope(args).await,
             "alias" => self.cmd_alias(rest).await,
@@ -886,6 +894,88 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(t, "runtime   : yanarkaze v{VERSION} on embassy-executor (cooperative async)\r\n");
         out!(t, "uptime    : {h:02}:{m:02}:{s:02}\r\n");
         out!(t, "reset     : {reason}\r\n");
+        if self.sleeps > 0 {
+            let (n, secs) = (self.sleeps, self.sleep_secs);
+            out!(t, "sleep     : {n} time(s), {secs} s in all (not counted in the uptime)\r\n");
+        }
+        if let Some((awake_ua, asleep_ua)) = self.sys.power_estimate() {
+            // Uptime is the time awake: the clock behind it stops in deep sleep.
+            let awake_s = Instant::now().as_secs() as f32;
+            let asleep_s = self.sleep_secs as f32;
+            let average_ua = (awake_ua as f32 * awake_s + asleep_ua as f32 * asleep_s) / (awake_s + asleep_s).max(1.0);
+            out!(
+                t,
+                "power     : ~{:.1} mA awake, ~{asleep_ua} uA asleep: ~{:.2} mA on average since boot\r\n",
+                awake_ua as f32 / 1000.0,
+                average_ua / 1000.0
+            );
+            out!(t, "            (chip alone, typical datasheet figures; the board's other parts draw more)\r\n");
+        }
+    }
+
+    /// Puts the board to sleep until the button or a key.
+    async fn cmd_sleep(&mut self) {
+        use crate::platform::Wake;
+        self.term.print("going to sleep: the button or a key wakes it (that key is not typed)\r\n").await;
+        self.term.flush().await;
+        Timer::after_millis(20).await; // let the output drain
+        let led = current_led_mode();
+        set_led_mode(LedMode::Off);
+        Timer::after_millis(10).await; // the LED task switches it off
+        let oled = self.oled_ready && self.oled_cmds(&[0xAE]).await.is_ok(); // display off
+        // A press that wakes the board must not also change the LED mode.
+        GAME_ACTIVE.store(true, Ordering::Relaxed);
+        BUTTON_SIGNAL.reset();
+        let started = Instant::now();
+        let (secs, woke_by, deep) = match self.sys.deep_sleep() {
+            Ok(slept) => (slept.secs, slept.woke_by, true),
+            Err(_) => {
+                // The executor already sleeps between events; just wait for one.
+                let mut buf = [0u8; 8];
+                let woke_by = match select(BUTTON_SIGNAL.wait(), self.rx.read(&mut buf)).await {
+                    Either::First(_) => Wake::Button,
+                    Either::Second(_) => Wake::Key,
+                };
+                (started.elapsed().as_secs() as u32, woke_by, false)
+            }
+        };
+        if deep {
+            match woke_by {
+                // Let the button task see the press that woke us, so it goes to the signal.
+                Wake::Button => {
+                    let _ = select(BUTTON_SIGNAL.wait(), Timer::after_millis(200)).await;
+                }
+                // The UART woke up in the middle of that key: drop whatever garbage it made.
+                Wake::Key => {
+                    let mut buf = [0u8; 8];
+                    while let Either::First(Ok(n)) = select(self.rx.read(&mut buf), Timer::after_millis(20)).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        BUTTON_SIGNAL.reset();
+        GAME_ACTIVE.store(self.in_menu, Ordering::Relaxed);
+        if self.in_menu {
+            self.menu_stopped = true; // the wake-up press does not count as a menu press
+        }
+        set_led_mode(led);
+        if oled {
+            let _ = self.oled_cmds(&[0xAF]).await;
+        }
+        if deep {
+            // Only deep sleep stops the uptime clock (and saves real power).
+            self.sleeps += 1;
+            self.sleep_secs += secs as u64;
+        }
+        let how = if woke_by == Wake::Button { "the button" } else { "a key" };
+        out!(self.term, "awake again after {secs} s, woken by {how}");
+        if !deep {
+            self.term.print(" (light sleep: this board cannot stop its clocks)").await;
+        }
+        self.term.print("\r\n").await;
     }
 
     async fn cmd_ps(&mut self) {

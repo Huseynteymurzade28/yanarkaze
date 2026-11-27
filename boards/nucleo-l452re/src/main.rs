@@ -40,7 +40,8 @@ use embassy_time::{Duration, Timer};
 use heapless::String;
 use static_cell::StaticCell;
 use yanarkaze_core::{
-    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull as CorePull, Reading, Sensor, System, Watchdog,
+    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull as CorePull, Reading, Sensor, Slept, System,
+    Wake, Watchdog,
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -298,6 +299,8 @@ struct NucleoSystem {
     sda: usize,
     adc: &'static SharedAdc,
     flash: Flash<'static, flash::Blocking>,
+    /// The USER button's polarity (see [`UserButton`]), for telling what woke a deep sleep.
+    button_active_high: bool,
 }
 
 impl NucleoSystem {
@@ -528,6 +531,113 @@ impl System for NucleoSystem {
         self.flash.blocking_read(SETTINGS_OFFSET, &mut buf[..n]).map_err(|_| HwError::Bus)
     }
 
+    /// Stop 2: about a microampere for the chip. The RTC's wakeup timer brings it out once a
+    /// second to feed the watchdog (which keeps counting in Stop 2 and cannot be stopped), and
+    /// it goes straight back to sleep until the button or a falling edge on the console's RX
+    /// pin (a start bit) wakes it for good.
+    fn deep_sleep(&mut self) -> Result<Slept, HwError> {
+        use cortex_m::peripheral::NVIC;
+        use pac::Interrupt;
+        use pac::{EXTI, IWDG as IWDG_REGS, PWR};
+
+        /// PA3 is USART2 RX; RTC wakeup is EXTI line 20 on the STM32L4.
+        const KEY_LINE: usize = 3;
+        const RTC_LINE: usize = 20;
+
+        if !rtc_wakeup(true) {
+            return Err(HwError::Unsupported);
+        }
+        pac::SYSCFG.exticr(0).modify(|w| w.set_exti(KEY_LINE, 0)); // port A
+        EXTI.ftsr(0).modify(|w| w.set_line(KEY_LINE, true));
+        EXTI.rtsr(0).modify(|w| w.set_line(RTC_LINE, true));
+        EXTI.imr(0).modify(|w| {
+            w.set_line(KEY_LINE, true);
+            w.set_line(RTC_LINE, true);
+        });
+        // Their interrupts stay off: the lines only have to wake the core (SEVONPEND makes a
+        // pending interrupt wake WFE even when disabled), and embassy's EXTI handler would
+        // otherwise clear the pending bit this loop reads.
+        let exti3_was_on = NVIC::is_enabled(Interrupt::EXTI3);
+        NVIC::mask(Interrupt::EXTI3);
+        NVIC::mask(Interrupt::RTC_WKUP);
+        // SAFETY: the shell owns the CPU until this returns; nothing else touches SCB.
+        let mut cp = unsafe { cortex_m::Peripherals::steal() };
+        // SAFETY: setting SEVONPEND (bit 4) in SCR only changes what wakes WFE.
+        unsafe { cp.SCB.scr.modify(|r| r | 1 << 4) };
+        cp.SCB.set_sleepdeep();
+        PWR.cr1().modify(|w| w.set_lpms(pac::pwr::vals::Lpms::STOP2));
+        // Wake on HSI16, which the PLL runs from.
+        pac::RCC.cfgr().modify(|w| w.set_stopwuck(pac::rcc::vals::Stopwuck::HSI));
+
+        let mut secs = 0u32;
+        let woke_by = loop {
+            IWDG_REGS.kr().write(|w| w.set_key(pac::iwdg::vals::Key::RESET));
+            EXTI.pr(0).write(|w| {
+                w.set_line(KEY_LINE, true);
+                w.set_line(RTC_LINE, true);
+            });
+            pac::RTC.isr().modify(|w| w.set_wutf(false));
+            NVIC::unpend(Interrupt::EXTI3);
+            NVIC::unpend(Interrupt::RTC_WKUP);
+            cortex_m::asm::dsb();
+            // The first WFE consumes any event already latched; the second one sleeps.
+            cortex_m::asm::sev();
+            cortex_m::asm::wfe();
+            cortex_m::asm::wfe();
+            // Awake, on HSI16 (the PLL stays off until we are done).
+            let pr = EXTI.pr(0).read();
+            if pr.line(KEY_LINE) {
+                break Wake::Key;
+            }
+            let button_level = pac::GPIOC.idr().read().idr(13) == pac::gpio::vals::Idr::HIGH;
+            if button_level == self.button_active_high {
+                break Wake::Button;
+            }
+            if pr.line(RTC_LINE) {
+                secs += 1;
+            }
+            // Anything else was a stray wake-up: back to sleep.
+        };
+
+        cp.SCB.clear_sleepdeep();
+        // SAFETY: as above.
+        unsafe { cp.SCB.scr.modify(|r| r & !(1 << 4)) };
+        PWR.cr1().modify(|w| w.set_lpms(pac::pwr::vals::Lpms::STOP0));
+        EXTI.imr(0).modify(|w| {
+            w.set_line(KEY_LINE, false);
+            w.set_line(RTC_LINE, false);
+        });
+        EXTI.ftsr(0).modify(|w| w.set_line(KEY_LINE, false));
+        EXTI.rtsr(0).modify(|w| w.set_line(RTC_LINE, false));
+        EXTI.pr(0).write(|w| {
+            w.set_line(KEY_LINE, true);
+            w.set_line(RTC_LINE, true);
+        });
+        NVIC::unpend(Interrupt::EXTI3);
+        NVIC::unpend(Interrupt::RTC_WKUP);
+        if exti3_was_on {
+            // SAFETY: restoring the state embassy left it in.
+            unsafe { NVIC::unmask(Interrupt::EXTI3) };
+        }
+        rtc_wakeup(false);
+        restore_clocks();
+        // The UART was off for part of the character that woke us; clear its error flags.
+        pac::USART2.icr().write(|w| {
+            w.set_fe(true);
+            w.set_ne(true);
+            w.set_ore(true);
+            w.set_pe(true);
+        });
+        IWDG_REGS.kr().write(|w| w.set_key(pac::iwdg::vals::Key::RESET));
+        Ok(Slept { secs, woke_by })
+    }
+
+    fn power_estimate(&self) -> Option<(u32, u32)> {
+        // STM32L452 datasheet, typical: about 8 mA running at 80 MHz from flash, about 1 uA
+        // in Stop 2 with the RTC.
+        Some((8_000, 1))
+    }
+
     fn log_geometry(&self) -> Option<(usize, usize)> {
         // Only if the program stays clear of it, should the firmware ever grow that far.
         (image_end() <= FLASH_BASE as u32 + LOG_OFFSET).then_some((LOG_PAGES as usize, SETTINGS_PAGE as usize))
@@ -616,6 +726,69 @@ impl NucleoSystem {
         }
         Ok(LOG_OFFSET + offset as u32)
     }
+}
+
+/// Turns the RTC's wakeup timer on (once a second) or off. Returns false if the RTC clock
+/// does not run, in which case deep sleep is not safe: nothing would feed the watchdog.
+fn rtc_wakeup(on: bool) -> bool {
+    use pac::{PWR, RCC, RTC};
+    RCC.apb1enr1().modify(|w| {
+        w.set_pwren(true);
+        w.set_rtcapben(true);
+    });
+    PWR.cr1().modify(|w| w.set_dbp(true)); // the RTC lives in the backup domain
+    if on {
+        RCC.csr().modify(|w| w.set_lsion(true));
+        while !RCC.csr().read().lsirdy() {}
+        if RCC.bdcr().read().rtcsel() == pac::rcc::vals::Rtcsel::DISABLE {
+            RCC.bdcr().modify(|w| w.set_rtcsel(pac::rcc::vals::Rtcsel::LSI));
+        }
+        RCC.bdcr().modify(|w| w.set_rtcen(true));
+    }
+    RTC.wpr().write(|w| w.set_key(0xCA));
+    RTC.wpr().write(|w| w.set_key(0x53));
+    RTC.cr().modify(|w| {
+        w.set_wute(false);
+        w.set_wutie(false);
+    });
+    let mut ok = true;
+    if on {
+        // WUTWF says the timer may be configured; it needs the RTC clock to be running.
+        let mut tries = 0u32;
+        while !RTC.isr().read().wutwf() {
+            tries += 1;
+            if tries > 1_000_000 {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            // RTC clock / 16: 2 kHz from the 32 kHz LSI (2048 Hz from a 32.768 kHz LSE).
+            RTC.wutr().write(|w| w.set_wut(2000 - 1));
+            RTC.cr().modify(|w| {
+                w.set_wucksel(pac::rtc::vals::Wucksel::DIV16);
+                w.set_wutie(true);
+                w.set_wute(true);
+            });
+        }
+    }
+    RTC.wpr().write(|w| w.set_key(0xFF));
+    ok
+}
+
+/// Stop 2 turns the PLL and HSI48 off and wakes on HSI16; this brings back the 80 MHz the
+/// rest of the firmware (UART baud rate, timers, ADC) was set up for.
+fn restore_clocks() {
+    use pac::RCC;
+    use pac::rcc::vals::Sw;
+    RCC.cr().modify(|w| w.set_hsion(true));
+    while !RCC.cr().read().hsirdy() {}
+    RCC.cr().modify(|w| w.set_pllon(true));
+    while !RCC.cr().read().pllrdy() {}
+    RCC.cfgr().modify(|w| w.set_sw(Sw::PLL1_R));
+    while RCC.cfgr().read().sws() != Sw::PLL1_R {}
+    RCC.crrcr().modify(|w| w.set_hsi48on(true)); // for the RNG
+    while !RCC.crrcr().read().hsi48rdy() {}
 }
 
 /// Arduino D14 (SDA) is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P, and the
@@ -722,7 +895,8 @@ async fn main(spawner: Spawner) {
         NucleoLed { a: Output::new(p.PA5, Level::Low, Speed::Low), b: Output::new(p.PB13, Level::Low, Speed::Low) };
     let pin = ExtiInput::new(p.PC13, p.EXTI13, Pull::None, Irqs);
     // Nobody holds the button during boot, so it reads its idle level: low means the -P.
-    let button = UserButton { active_high: pin.is_low(), pin };
+    let button_active_high = pin.is_low();
+    let button = UserButton { active_high: button_active_high, pin };
     let wdg = Iwdg(IndependentWatchdog::new(p.IWDG, 2_000_000)); // 2 s timeout
     // I2C1 on the Arduino header's SCL/SDA (D15/D14). The internal pull-ups are weak
     // (about 40k); most OLED modules bring their own, which is what makes 400 kHz work.
@@ -744,7 +918,7 @@ async fn main(spawner: Spawner) {
     let adc_pins = [p.PA0.degrade_adc(), p.PA1.degrade_adc(), p.PC1.degrade_adc(), p.PC0.degrade_adc()];
     let adc = &*ADC.init(Mutex::new(AdcBank::new(p.ADC1, adc_pins).await));
     let flash = Flash::new_blocking(p.FLASH);
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc, flash };
+    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc, flash, button_active_high };
 
     spawner.spawn(shell_task(sys, uart_rx, ConsoleTx(uart_tx), spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());

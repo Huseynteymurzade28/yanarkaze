@@ -697,7 +697,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     // OLED (SSD1306, 128x64, I2C address 0x3C)
     // -----------------------------------------------------------------------
 
-    async fn oled_cmds(&mut self, cmds: &[u8]) -> Result<(), HwError> {
+    pub(crate) async fn oled_cmds(&mut self, cmds: &[u8]) -> Result<(), HwError> {
         let mut buf = [0u8; 32];
         buf[0] = oled::CMD;
         buf[1..=cmds.len()].copy_from_slice(cmds);

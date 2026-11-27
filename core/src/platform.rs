@@ -118,6 +118,22 @@ pub struct BoardInfo {
     pub hints: &'static [&'static str],
 }
 
+/// What ended a [`System::deep_sleep`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    Button,
+    /// A key on the console. Its byte is lost: the UART was asleep when it arrived.
+    Key,
+}
+
+/// The result of a [`System::deep_sleep`].
+#[derive(Clone, Copy, Debug)]
+pub struct Slept {
+    /// Seconds asleep, counted by a clock that keeps running in deep sleep.
+    pub secs: u32,
+    pub woke_by: Wake,
+}
+
 /// Everything else the shell needs from the platform.
 pub trait System {
     fn info(&self) -> &BoardInfo;
@@ -235,6 +251,21 @@ pub trait System {
     /// Erases page `page` of the log area to 0xFF.
     fn log_erase(&mut self, _page: usize) -> Result<(), HwError> {
         Err(HwError::Unsupported)
+    }
+
+    /// Stops the CPU and most clocks until the button is pressed or a key arrives on the
+    /// console, and returns when awake again with every clock back. This blocks: nothing
+    /// runs while the chip sleeps, and the time it slept does not count as uptime. The board
+    /// keeps its watchdog fed meanwhile. The default is `Unsupported`, and `sleep` then
+    /// waits in the executor's ordinary idle sleep instead.
+    fn deep_sleep(&mut self) -> Result<Slept, HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Typical current drawn by the microcontroller alone, awake and in [`Self::deep_sleep`],
+    /// in microamps, for the estimate in `info`.
+    fn power_estimate(&self) -> Option<(u32, u32)> {
+        None
     }
 
     fn i2c_pins(&self) -> Option<&'static str> {

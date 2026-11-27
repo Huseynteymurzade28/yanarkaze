@@ -98,6 +98,7 @@ System:
   autorun [cmd|off]    a command line to run at boot
   save                 keep the aliases and the autorun across reboots (in flash)
   forget               erase the saved settings
+  sleep                deep sleep until the button or a key; info shows a power estimate
   log [start|show|csv] temperature log in flash: log start 5m, log show, log csv, log stop,
                        log clear (NUCLEO: 4096 records, about 68 h at one a minute)
   menu                 use the board without a computer: OLED menu, tap the button = next,
@@ -171,6 +172,12 @@ stops what is running and brings the menu back.
 is one, and carries on after resets (each one is marked in the log). `log show` charts it
 all, oldest to newest, in the terminal and on the OLED; `log csv` prints it for a
 spreadsheet. When the log is full, the oldest records make room.
+
+`sleep` puts the NUCLEO in Stop 2, where the chip draws about a microampere instead of
+about 8 mA (typical datasheet figures; the board's ST-LINK draws far more, so this shows on
+the board's IDD jumper, not on the USB cable). The RTC wakes it once a second to feed the
+watchdog. The button or a key on the console wakes it for good; that key is not typed, the
+UART is asleep when it arrives. Other boards wait in the executor's normal idle sleep.
 
 For `scope`, wire a PWM output to an analog pin: `pwm D3 25 1000; scope A0 20` shows a
 1 kHz square wave at 25 % duty (in the simulator, PWM output reaches every analog pin).
