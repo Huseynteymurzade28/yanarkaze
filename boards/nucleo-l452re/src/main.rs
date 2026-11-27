@@ -7,6 +7,7 @@
 //!   sensor   -> internal temperature sensor + VREFINT through ADC1
 //!   watchdog -> IWDG, 2 s timeout
 //!   RNG      -> hardware TRNG (48 MHz from HSI48)
+//!   I2C      -> I2C1 on PB8 (SCL, Arduino D15) and PB9 (SDA, D14), DMA2 channels 6 and 7
 
 #![no_std]
 #![no_main]
@@ -17,7 +18,10 @@ use cortex_m::peripheral::DWT;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::adc::{Adc, SampleTime, Temperature, VrefInt};
+use embassy_embedded_hal::SetConfig;
 use embassy_stm32::exti::{self, ExtiInput};
+use embassy_stm32::i2c::{self, I2c};
+use embassy_stm32::time::Hertz;
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::peripherals::{ADC1, IWDG, RNG};
@@ -25,10 +29,10 @@ use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::usart::{self, RingBufferedUartRx, Uart, UartTx};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{Config, Peri, bind_interrupts, interrupt, pac, peripherals};
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer, with_timeout};
 use heapless::String;
 use static_cell::StaticCell;
-use yanarkaze_core::{BoardInfo, Button, Led, MemRegion, Reading, Sensor, System, Watchdog};
+use yanarkaze_core::{BoardInfo, Button, HwError, Led, MemRegion, Reading, Sensor, System, Watchdog};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -37,7 +41,17 @@ bind_interrupts!(struct Irqs {
     DMA1_CHANNEL7 => embassy_stm32::dma::InterruptHandler<peripherals::DMA1_CH7>;
     EXTI15_10 => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
     RNG => rng::InterruptHandler<peripherals::RNG>;
+    I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
+    I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
+    // DMA1 channels 6 and 7 belong to the console, so I2C1 uses its DMA2 request.
+    DMA2_CHANNEL6 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH6>;
+    DMA2_CHANNEL7 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH7>;
 });
+
+const I2C_TIMEOUT: Duration = Duration::from_millis(50);
+/// I2C1 pins on GPIOB.
+const I2C_SCL: usize = 8;
+const I2C_SDA: usize = 9;
 
 const CPU_MHZ: u32 = 80;
 
@@ -154,6 +168,66 @@ impl Watchdog for Iwdg {
 struct NucleoSystem {
     rng: Rng<'static, RNG>,
     reset_reason: &'static str,
+    i2c: I2c<'static, Async, i2c::Master>,
+}
+
+impl NucleoSystem {
+    /// Maps the outcome of a timed I2C transfer, and frees the bus if it never finished.
+    fn i2c_result(&mut self, r: Result<Result<(), i2c::Error>, embassy_time::TimeoutError>) -> Result<(), HwError> {
+        match r {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(i2c::Error::Nack)) => Err(HwError::Nack),
+            Ok(Err(i2c::Error::Timeout)) | Err(_) => {
+                let _ = self.recover_bus();
+                Err(HwError::Timeout)
+            }
+            Ok(Err(_)) => Err(HwError::Bus),
+        }
+    }
+
+    /// The standard I2C bus recovery: with the pins switched to open-drain GPIO outputs,
+    /// clock SCL until the device holding SDA low lets go, send a STOP, then hand the pins
+    /// back to I2C1 and reset its state machine (clearing PE does that on this I2C block).
+    fn recover_bus(&mut self) -> Result<(bool, bool), HwError> {
+        use pac::gpio::vals::Moder;
+        let gpio = pac::GPIOB;
+        let half_bit = || cortex_m::asm::delay(CPU_MHZ * 5); // ~5 us: a 100 kHz clock
+        let high = |pin: usize| gpio.idr().read().idr(pin) == pac::gpio::vals::Idr::HIGH;
+        let release = |pin: usize| gpio.bsrr().write(|w| w.set_bs(pin, true));
+        let pull_low = |pin: usize| gpio.bsrr().write(|w| w.set_br(pin, true));
+
+        pac::I2C1.cr1().modify(|w| w.set_pe(false));
+        // The driver already set the pins to open drain; only the mode changes.
+        release(I2C_SCL);
+        release(I2C_SDA);
+        gpio.moder().modify(|w| {
+            w.set_moder(I2C_SCL, Moder::OUTPUT);
+            w.set_moder(I2C_SDA, Moder::OUTPUT);
+        });
+        half_bit();
+        for _ in 0..9 {
+            if high(I2C_SDA) {
+                break;
+            }
+            pull_low(I2C_SCL);
+            half_bit();
+            release(I2C_SCL);
+            half_bit();
+        }
+        // STOP: SDA goes high while SCL is high.
+        pull_low(I2C_SDA);
+        half_bit();
+        release(I2C_SDA);
+        half_bit();
+        let free = (high(I2C_SDA), high(I2C_SCL));
+
+        gpio.moder().modify(|w| {
+            w.set_moder(I2C_SCL, Moder::ALTERNATE);
+            w.set_moder(I2C_SDA, Moder::ALTERNATE);
+        });
+        pac::I2C1.cr1().modify(|w| w.set_pe(true));
+        Ok(free)
+    }
 }
 
 impl System for NucleoSystem {
@@ -185,6 +259,37 @@ impl System for NucleoSystem {
 
     fn reset(&mut self) -> ! {
         cortex_m::peripheral::SCB::sys_reset()
+    }
+
+    fn i2c_pins(&self) -> Option<&'static str> {
+        Some("SDA PB9 = D14, SCL PB8 = D15 (the two pins above AREF on the Arduino header)")
+    }
+
+    fn i2c_set_speed(&mut self, hz: u32) -> Result<u32, HwError> {
+        if !(10_000..=1_000_000).contains(&hz) {
+            return Err(HwError::OutOfRange);
+        }
+        self.i2c.set_config(&Hertz(hz)).map_err(|_| HwError::OutOfRange)?;
+        Ok(hz)
+    }
+
+    fn i2c_recover(&mut self) -> Result<(bool, bool), HwError> {
+        self.recover_bus()
+    }
+
+    async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.write(addr, bytes)).await;
+        self.i2c_result(r)
+    }
+
+    async fn i2c_read(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), HwError> {
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.read(addr, buf)).await;
+        self.i2c_result(r)
+    }
+
+    async fn i2c_write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), HwError> {
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.write_read(addr, bytes, buf)).await;
+        self.i2c_result(r)
     }
 }
 
@@ -281,7 +386,14 @@ async fn main(spawner: Spawner) {
         NucleoLed { a: Output::new(p.PA5, Level::Low, Speed::Low), b: Output::new(p.PB13, Level::Low, Speed::Low) };
     let button = UserButton(ExtiInput::new(p.PC13, p.EXTI13, Pull::None, Irqs));
     let wdg = Iwdg(IndependentWatchdog::new(p.IWDG, 2_000_000)); // 2 s timeout
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason };
+    // I2C1 on the Arduino header's SCL/SDA (D15/D14). The internal pull-ups are weak
+    // (about 40k); most OLED modules bring their own, which is what makes 400 kHz work.
+    let mut i2c_config = i2c::Config::default();
+    i2c_config.frequency = Hertz(400_000);
+    i2c_config.sda_pullup = true;
+    i2c_config.scl_pullup = true;
+    let i2c = I2c::new(p.I2C1, p.PB8, p.PB9, p.DMA2_CH7, p.DMA2_CH6, Irqs, i2c_config);
+    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c };
 
     spawner.spawn(shell_task(sys, uart_rx, uart_tx, spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());
