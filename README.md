@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="yanarkaze logo: a flame and a gust of wind in a circle" width="200">
+</p>
+
 # yanarkaze
 
 ```
@@ -103,7 +107,7 @@ System:
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
   clear                clear the screen
 
-Hardware (Pico 2 and the simulator for now):
+Hardware (Pico 2 and the simulator; i2c and oled also on the NUCLEO):
   pins                 which pins can do what on this board
   gpio <pin> <action>  on | off | toggle | read [up|down]   e.g. gpio 16 on
   pwm <pin> <%> [hz]   PWM output, e.g. LED brightness: pwm 16 25   (pwm 16 off)
@@ -168,6 +172,19 @@ cd boards/nucleo-l452re
 cargo run --release              # flash and stream defmt logs
 picocom -b 115200 /dev/ttyACM0   # in a second terminal: the shell
 ```
+
+I2C1 is on the Arduino header, so an SSD1306 OLED (or any I2C sensor) plugs straight in:
+
+| OLED pin | NUCLEO pin                                              |
+|----------|---------------------------------------------------------|
+| GND      | GND (CN6 power header, or CN5 just below AREF)          |
+| VCC      | 3V3 (CN6 power header)                                  |
+| SCL      | D15 = PB8 (CN5, the top pin, above SDA)                 |
+| SDA      | D14 = PB9 (CN5, the second pin from the top)            |
+
+Then `i2c scan` should find the display at 0x3C, the logo appears at the next boot, and
+`oled dash`, `snake` and `2048` draw on it. I2C1 uses DMA2 because the console's USART2
+already has DMA1 channels 6 and 7.
 
 ### Raspberry Pi Pico
 
