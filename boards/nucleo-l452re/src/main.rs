@@ -8,16 +8,19 @@
 //!   watchdog -> IWDG, 2 s timeout
 //!   RNG      -> hardware TRNG (48 MHz from HSI48)
 //!   I2C      -> I2C1 on Arduino D15 (SCL, PB8) and D14 (SDA: PB9, or PB7 on the -P board)
+//!   pins     -> GPIO, ADC1 and TIM2 PWM on the Arduino pins that are the same on both boards
 
 #![no_std]
 #![no_main]
+// `PA + 0` is written out so it reads like the pin name PA0.
+#![allow(clippy::identity_op)]
 
 use core::fmt::Write as _;
 
 use cortex_m::peripheral::DWT;
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::adc::{Adc, SampleTime, Temperature, VrefInt};
+use embassy_stm32::adc::{Adc, AdcChannel, AnyAdcChannel, SampleTime, Temperature, VrefInt};
 use embassy_embedded_hal::SetConfig;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::i2c::{self, I2c};
@@ -29,10 +32,14 @@ use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::usart::{self, RingBufferedUartRx, Uart, UartTx};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{Config, Peri, bind_interrupts, interrupt, pac, peripherals};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use heapless::String;
 use static_cell::StaticCell;
-use yanarkaze_core::{BoardInfo, Button, HwError, Led, MemRegion, Reading, Sensor, System, Watchdog};
+use yanarkaze_core::{
+    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull as CorePull, Reading, Sensor, System, Watchdog,
+};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -58,8 +65,66 @@ static INFO: BoardInfo = BoardInfo {
     flash_kib: Some(512),
     ram_kib: Some(160),
     button: "the blue USER button",
-    hints: &["try: led morse SOS, reaction, mandel, dump 0x1FFF7590 12"],
+    hints: &["try: led morse SOS, reaction, mandel, pins, knob A0 D3, dump 0x1FFF7590 12"],
 };
+
+// ---------------------------------------------------------------------------
+// Pins for the hardware commands
+// ---------------------------------------------------------------------------
+//
+// The NUCLEO-L452RE and the NUCLEO-L452RE-P route many Arduino pins to different MCU pins
+// (A2, A3, D5, D7-D13 differ), and one firmware runs on both. So the shell only offers the
+// Arduino pins that are the same on both boards. Pin numbers are port * 16 + bit
+// (`PinStyle::Port`): PA0 = 0, PB3 = 19, PC1 = 33.
+
+const PA: u8 = 0;
+const PB: u8 = 16;
+const PC: u8 = 32;
+
+static PINS: [PinInfo; 8] = [
+    PinInfo { pin: PA + 0, gpio: true, pwm: false, adc: true, note: "A0 (ADC1 IN5)" },
+    PinInfo { pin: PA + 1, gpio: true, pwm: false, adc: true, note: "A1 (ADC1 IN6)" },
+    PinInfo { pin: PC + 1, gpio: true, pwm: false, adc: true, note: "A4 (ADC1 IN2)" },
+    PinInfo { pin: PC + 0, gpio: true, pwm: false, adc: true, note: "A5 (ADC1 IN1)" },
+    PinInfo { pin: PA + 10, gpio: true, pwm: false, adc: false, note: "D2" },
+    PinInfo { pin: PB + 3, gpio: true, pwm: true, adc: false, note: "D3 (TIM2 CH2)" },
+    PinInfo { pin: PB + 5, gpio: true, pwm: false, adc: false, note: "D4" },
+    PinInfo { pin: PB + 10, gpio: true, pwm: true, adc: false, note: "D6 (TIM2 CH3, same frequency as D3)" },
+];
+
+static ALIASES: [(&str, u8); 8] = [
+    ("A0", PA + 0),
+    ("A1", PA + 1),
+    ("A4", PC + 1),
+    ("A5", PC + 0),
+    ("D2", PA + 10),
+    ("D3", PB + 3),
+    ("D4", PB + 5),
+    ("D6", PB + 10),
+];
+
+static RESERVED: [(&str, &str); 5] = [
+    ("PA2/3", "console (USART2 to the ST-LINK), Arduino D1/D0"),
+    ("PA5", "LED LD2 (NUCLEO-L452RE)"),
+    ("PB13", "LED LD4 (NUCLEO-L452RE-P)"),
+    ("PC13", "blue USER button"),
+    ("D14/15", "I2C1 (SDA, SCL)"),
+];
+
+/// The ADC pins in `AdcBank::pins` order.
+const ADC_PINS: [u8; 4] = [PA + 0, PA + 1, PC + 1, PC + 0];
+
+/// PWM pins: (pin, TIM2 channel index 0..=3). Both are alternate function 1.
+const PWM_PINS: [(u8, usize); 2] = [(PB + 3, 1), (PB + 10, 2)];
+const TIM2_HZ: u32 = CPU_MHZ * 1_000_000; // APB1 is not divided, so TIM2 runs at SYSCLK
+
+fn gpio_port(pin: u8) -> pac::gpio::Gpio {
+    match pin / 16 {
+        0 => pac::GPIOA,
+        1 => pac::GPIOB,
+        _ => pac::GPIOC,
+    }
+}
 
 /// Regions that are safe to read on the STM32L452 (anything else may HardFault).
 static REGIONS: [MemRegion; 4] = [
@@ -107,17 +172,21 @@ const TS_CAL1: *const u16 = 0x1FFF_75A8 as *const u16; // 30 degC
 const TS_CAL2: *const u16 = 0x1FFF_75CA as *const u16; // 130 degC
 const CAL_VDDA_MV: f32 = 3000.0;
 
-struct DieSensor {
+/// ADC1 with everything read through it, shared by the sensor task and the `adc` command.
+struct AdcBank {
     adc: Adc<'static, ADC1>,
     vrefint: VrefInt,
     temperature: Temperature,
     vref_cal: f32,
     ts_cal1: f32,
     ts_cal2: f32,
+    pins: [AnyAdcChannel<'static, ADC1>; 4],
 }
 
-impl DieSensor {
-    async fn new(adc: Peri<'static, ADC1>) -> Self {
+type SharedAdc = Mutex<CriticalSectionRawMutex, AdcBank>;
+
+impl AdcBank {
+    async fn new(adc: Peri<'static, ADC1>, pins: [AnyAdcChannel<'static, ADC1>; 4]) -> Self {
         let adc = Adc::new(adc);
         let vrefint = adc.enable_vrefint();
         let temperature = adc.enable_temperature();
@@ -130,19 +199,27 @@ impl DieSensor {
         let (vref_cal, ts_cal1, ts_cal2) = unsafe {
             (VREFINT_CAL.read_volatile() as f32, TS_CAL1.read_volatile() as f32, TS_CAL2.read_volatile() as f32)
         };
-        Self { adc, vrefint, temperature, vref_cal, ts_cal1, ts_cal2 }
+        Self { adc, vrefint, temperature, vref_cal, ts_cal1, ts_cal2, pins }
+    }
+
+    /// The supply voltage, from the internal reference and its factory calibration.
+    fn vdda_mv(&mut self) -> f32 {
+        let vref_raw = self.adc.blocking_read(&mut self.vrefint, SampleTime::CYCLES640_5) as f32;
+        CAL_VDDA_MV * self.vref_cal / vref_raw
     }
 }
 
+struct DieSensor(&'static SharedAdc);
+
 impl Sensor for DieSensor {
     async fn read(&mut self) -> Reading {
-        let vref_raw = self.adc.blocking_read(&mut self.vrefint, SampleTime::CYCLES640_5) as f32;
-        let ts_raw = self.adc.blocking_read(&mut self.temperature, SampleTime::CYCLES640_5) as f32;
-
-        let vdda_mv = CAL_VDDA_MV * self.vref_cal / vref_raw;
+        let mut bank = self.0.lock().await;
+        let vdda_mv = bank.vdda_mv();
+        let bank = &mut *bank;
+        let ts_raw = bank.adc.blocking_read(&mut bank.temperature, SampleTime::CYCLES640_5) as f32;
         // Scale the reading to the calibration voltage, then interpolate between the two points.
         let ts_scaled = ts_raw * vdda_mv / CAL_VDDA_MV;
-        let temp_c = (130.0 - 30.0) / (self.ts_cal2 - self.ts_cal1) * (ts_scaled - self.ts_cal1) + 30.0;
+        let temp_c = (130.0 - 30.0) / (bank.ts_cal2 - bank.ts_cal1) * (ts_scaled - bank.ts_cal1) + 30.0;
         Reading { temp_c, vdda_mv: Some(vdda_mv as u32) }
     }
 }
@@ -193,9 +270,22 @@ struct NucleoSystem {
     i2c: I2c<'static, Blocking, i2c::Master>,
     /// GPIOB pin number of SDA: 9 on the NUCLEO-L452RE, 7 on the NUCLEO-L452RE-P.
     sda: usize,
+    adc: &'static SharedAdc,
 }
 
 impl NucleoSystem {
+    fn check_pin(&self, pin: u8, can: impl Fn(&PinInfo) -> bool) -> Result<(), HwError> {
+        match PINS.iter().find(|p| p.pin == pin) {
+            Some(p) if can(p) => Ok(()),
+            Some(_) => Err(HwError::WrongPin),
+            None => Err(HwError::NoSuchPin),
+        }
+    }
+
+    fn set_mode(pin: u8, mode: pac::gpio::vals::Moder) {
+        gpio_port(pin).moder().modify(|w| w.set_moder((pin % 16) as usize, mode));
+    }
+
     /// Maps the outcome of an I2C transfer, and frees the bus if it never finished.
     fn i2c_result(&mut self, r: Result<(), i2c::Error>) -> Result<(), HwError> {
         match r {
@@ -286,6 +376,92 @@ impl System for NucleoSystem {
         cortex_m::peripheral::SCB::sys_reset()
     }
 
+    fn pins(&self) -> &[PinInfo] {
+        &PINS
+    }
+
+    fn pin_style(&self) -> PinStyle {
+        PinStyle::Port
+    }
+
+    fn pin_aliases(&self) -> &[(&'static str, u8)] {
+        &ALIASES
+    }
+
+    fn reserved_pins(&self) -> &[(&'static str, &'static str)] {
+        &RESERVED
+    }
+
+    fn gpio_write(&mut self, pin: u8, high: bool) -> Result<(), HwError> {
+        use pac::gpio::vals::{Moder, Ot};
+        self.check_pin(pin, |p| p.gpio)?;
+        let (port, bit) = (gpio_port(pin), (pin % 16) as usize);
+        // Level first, so the pin does not glitch when it becomes an output.
+        port.bsrr().write(|w| if high { w.set_bs(bit, true) } else { w.set_br(bit, true) });
+        port.otyper().modify(|w| w.set_ot(bit, Ot::PUSH_PULL));
+        Self::set_mode(pin, Moder::OUTPUT); // also takes a pin back from PWM
+        Ok(())
+    }
+
+    fn gpio_read(&mut self, pin: u8, pull: CorePull) -> Result<bool, HwError> {
+        use pac::gpio::vals::{Moder, Pupdr};
+        self.check_pin(pin, |p| p.gpio)?;
+        let (port, bit) = (gpio_port(pin), (pin % 16) as usize);
+        let pupdr = match pull {
+            CorePull::None => Pupdr::FLOATING,
+            CorePull::Up => Pupdr::PULL_UP,
+            CorePull::Down => Pupdr::PULL_DOWN,
+        };
+        port.pupdr().modify(|w| w.set_pupdr(bit, pupdr));
+        Self::set_mode(pin, Moder::INPUT);
+        cortex_m::asm::delay(CPU_MHZ * 10); // ~10 us for the pull to charge the pin
+        Ok(port.idr().read().idr(bit) == pac::gpio::vals::Idr::HIGH)
+    }
+
+    fn pwm_set(&mut self, pin: u8, freq_hz: u32, duty: u16) -> Result<u32, HwError> {
+        use pac::gpio::vals::Moder;
+        use pac::timer::vals::Ocm;
+        self.check_pin(pin, |p| p.pwm)?;
+        let ch = PWM_PINS.iter().find(|&&(p, _)| p == pin).map(|&(_, ch)| ch).ok_or(HwError::WrongPin)?;
+        if !(1..=1_000_000).contains(&freq_hz) || duty > 1000 {
+            return Err(HwError::OutOfRange);
+        }
+        pac::RCC.apb1enr1().modify(|w| w.set_tim2en(true));
+        let tim = pac::TIM2;
+        // TIM2 is 32 bits wide, so no prescaler is needed even at 1 Hz.
+        let period = TIM2_HZ / freq_hz;
+        tim.psc().write_value(0);
+        tim.arr().write_value(period - 1);
+        tim.ccr(ch).write_value((period as u64 * duty as u64 / 1000) as u32);
+        tim.ccmr_output(ch / 2).modify(|w| {
+            w.set_ocm(ch % 2, Ocm::PWM_MODE1);
+            w.set_ocpe(ch % 2, true);
+        });
+        tim.ccer().modify(|w| w.set_cce(ch, true));
+        tim.cr1().modify(|w| {
+            w.set_arpe(true);
+            w.set_cen(true);
+        });
+        tim.egr().write(|w| w.set_ug(true)); // load ARR and CCR now, not at the next overflow
+
+        let (port, bit) = (gpio_port(pin), (pin % 16) as usize);
+        port.afr(bit / 8).modify(|w| w.set_afr(bit % 8, 1)); // AF1 = TIM2
+        Self::set_mode(pin, Moder::ALTERNATE);
+        Ok(TIM2_HZ / period)
+    }
+
+    async fn adc_read(&mut self, pin: u8) -> Result<u32, HwError> {
+        self.check_pin(pin, |p| p.adc)?;
+        let index = ADC_PINS.iter().position(|&p| p == pin).ok_or(HwError::WrongPin)?;
+        // `gpio` may have taken the pin; give it back to the ADC.
+        Self::set_mode(pin, pac::gpio::vals::Moder::ANALOG);
+        let mut bank = self.adc.lock().await;
+        let vdda_mv = bank.vdda_mv();
+        let bank = &mut *bank;
+        let raw = bank.adc.blocking_read(&mut bank.pins[index], SampleTime::CYCLES247_5) as f32;
+        Ok((raw * vdda_mv / 4095.0) as u32)
+    }
+
     fn i2c_pins(&self) -> Option<&'static str> {
         Some(if self.sda == 7 {
             "SDA D14 = PB7, SCL D15 = PB8, the two pins above AREF"
@@ -373,8 +549,8 @@ async fn button_task(button: UserButton) {
 }
 
 #[embassy_executor::task]
-async fn sensor_task(adc: Peri<'static, ADC1>) {
-    yanarkaze_core::sensor::run(DieSensor::new(adc).await).await
+async fn sensor_task(adc: &'static SharedAdc) {
+    yanarkaze_core::sensor::run(DieSensor(adc)).await
 }
 
 #[embassy_executor::task]
@@ -446,12 +622,15 @@ async fn main(spawner: Spawner) {
     } else {
         I2c::new_blocking(p.I2C1, p.PB8, pb9, i2c_config)
     };
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda };
+    static ADC: StaticCell<SharedAdc> = StaticCell::new();
+    let adc_pins = [p.PA0.degrade_adc(), p.PA1.degrade_adc(), p.PC1.degrade_adc(), p.PC0.degrade_adc()];
+    let adc = &*ADC.init(Mutex::new(AdcBank::new(p.ADC1, adc_pins).await));
+    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc };
 
     spawner.spawn(shell_task(sys, uart_rx, ConsoleTx(uart_tx), spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());
     spawner.spawn(button_task(button).unwrap());
-    spawner.spawn(sensor_task(p.ADC1).unwrap());
+    spawner.spawn(sensor_task(adc).unwrap());
     spawner.spawn(watchdog_task(wdg).unwrap());
 
     info!("all tasks spawned");

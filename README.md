@@ -107,13 +107,13 @@ System:
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
   clear                clear the screen
 
-Hardware (Pico 2 and the simulator; i2c and oled also on the NUCLEO):
+Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   pins                 which pins can do what on this board
   gpio <pin> <action>  on | off | toggle | read [up|down]   e.g. gpio 16 on
   pwm <pin> <%> [hz]   PWM output, e.g. LED brightness: pwm 16 25   (pwm 16 off)
   fade <pin> [ms]      make an LED breathe (any key stops)
   adc <pin> [watch]    read an analog pin in millivolts, e.g. a potentiometer
-  knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16
+  knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16 (NUCLEO: knob A0 D3)
   i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
   oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
                        | clear | invert | contrast <0-255> | on | off
@@ -186,8 +186,21 @@ D14 is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P; the firmware fin
 boot from the module's pull-ups, so attach the display before powering up.
 
 Then `i2c scan` should find the display at 0x3C, the logo appears at the next boot, and
-`oled dash`, `snake` and `2048` draw on it. I2C is blocking on this board, so a full OLED
-frame pauses the other tasks for about 25 ms.
+`oled dash`, `snake`, `2048`, `top`, `mandel` and `knob` draw on it. I2C is blocking on this
+board, so a full OLED frame pauses the other tasks for about 25 ms.
+
+The hardware commands use the Arduino pins that are wired the same on the NUCLEO-L452RE and
+the -P (many others differ between the two). Type them by Arduino name or MCU name:
+
+| Pin       | Can do      | Arduino name |
+|-----------|-------------|--------------|
+| PA0, PA1  | GPIO, ADC   | A0, A1       |
+| PC1, PC0  | GPIO, ADC   | A4, A5       |
+| PA10, PB5 | GPIO        | D2, D4       |
+| PB3, PB10 | GPIO, PWM   | D3, D6 (both on TIM2, so they share one frequency) |
+
+For `knob A0 D3`: a potentiometer's outer legs to 3V3 and GND and its middle leg to A0, and
+an LED from D3 through a 220-330 ohm resistor to GND.
 
 ### Raspberry Pi Pico
 
