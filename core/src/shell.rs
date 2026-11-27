@@ -87,6 +87,10 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
         ..cmd("i2c", "scan|read|write", "find I2C devices, read or write registers")
     },
     Command {
+        completions: &["watch"],
+        ..cmd("env", "[watch]", "room temperature, humidity, pressure (BME280, SHT3x, AHT20)")
+    },
+    Command {
         completions: OLED_ACTIONS,
         ..cmd("oled", "<action>", "0.96\" I2C display: text <msg> | temp | dash | life | logo | preview | clear")
     },
@@ -441,6 +445,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "adc" => self.cmd_adc(args).await,
             "knob" => self.cmd_knob(args).await,
             "i2c" => self.cmd_i2c(args).await,
+            "env" => self.cmd_env(args).await,
             "oled" => self.cmd_oled(rest).await,
             "calc" => self.cmd_calc(rest).await,
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.

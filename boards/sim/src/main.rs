@@ -226,6 +226,8 @@ struct SimSystem {
     regions: [MemRegion; 1],
     /// Output levels of the simulated pins (bit n = GPn).
     levels: u32,
+    /// The last bytes written to each fake I2C device: its pending command.
+    i2c_cmd: [Vec<u8>; 128],
 }
 
 /// Pretend header: GP0-15 for gpio / pwm, GP26-28 analog.
@@ -243,8 +245,38 @@ static SIM_PINS: [PinInfo; 19] = {
     pins
 };
 
-/// Fake I2C devices so `i2c scan` finds something: an OLED and a BME280 (chip ID 0x60).
-const SIM_I2C: [u8; 2] = [0x3C, 0x76];
+/// Fake I2C devices: an OLED, and one of each room sensor `env` knows, answering like the
+/// real chips so the drivers run end to end.
+const SIM_I2C: [u8; 4] = [0x3C, 0x76, 0x44, 0x38];
+
+/// Slowly drifting fake room conditions: about 22-24 degC and 40-50 %RH.
+fn sim_room() -> (f32, f32) {
+    let t = STARTED.get_or_init(Instant::now).elapsed().as_secs_f32();
+    (23.0 + (t / 20.0).sin(), 45.0 + 5.0 * (t / 33.0).cos())
+}
+
+/// A BME280's registers. The calibration is the BMP280 datasheet's example plus typical
+/// humidity values; the raw readings are worked backwards from `sim_room` roughly (the
+/// fake only needs to move plausibly, not be exact).
+fn sim_bme280_regs() -> [u8; 256] {
+    let mut r = [0u8; 256];
+    r[0xD0] = 0x60;
+    let tp: [i32; 12] = [27504, 26435, -1000, 36477, -10685, 3024, 2855, 140, -7, 15500, -14600, 6000];
+    for (i, v) in tp.iter().enumerate() {
+        r[0x88 + 2 * i..0x8A + 2 * i].copy_from_slice(&(*v as i16).to_le_bytes());
+    }
+    r[0xA1] = 75; // H1
+    r[0xE1..0xE8].copy_from_slice(&[0x72, 0x01, 0x00, 0x13, 0x29, 0x03, 0x1E]); // H2..H6
+    let (temp, rh) = sim_room();
+    // Near the datasheet's example point, adc_T moves about 5150 counts per degree.
+    let adc_t = (519888.0 + (temp - 25.08) * 5150.0) as u32;
+    let adc_p = 415148u32;
+    let adc_h = (14000.0 + rh * 300.0) as u32;
+    r[0xF7..0xFA].copy_from_slice(&[(adc_p >> 12) as u8, (adc_p >> 4) as u8, (adc_p << 4) as u8]);
+    r[0xFA..0xFD].copy_from_slice(&[(adc_t >> 12) as u8, (adc_t >> 4) as u8, (adc_t << 4) as u8]);
+    r[0xFD..0xFF].copy_from_slice(&(adc_h as u16).to_be_bytes());
+    r
+}
 
 fn sim_pin(pin: u8, what: fn(&PinInfo) -> bool) -> Result<(), HwError> {
     match SIM_PINS.iter().find(|p| p.pin == pin) {
@@ -279,6 +311,7 @@ impl SimSystem {
             rng: XorShift::from_time(),
             regions: [MemRegion { start: rom, end: rom + SIM_ROM.len(), name: "simulated ROM" }],
             levels: 0,
+            i2c_cmd: std::array::from_fn(|_| Vec::new()),
         }
     }
 }
@@ -351,7 +384,7 @@ impl System for SimSystem {
     }
 
     fn i2c_pins(&self) -> Option<&'static str> {
-        Some("simulated bus with an OLED at 0x3c and a BME280 at 0x76")
+        Some("simulated bus: an OLED, a BME280, an SHT31 and an AHT20")
     }
 
     fn i2c_set_speed(&mut self, hz: u32) -> Result<u32, HwError> {
@@ -362,22 +395,68 @@ impl System for SimSystem {
         Ok((true, true))
     }
 
-    async fn i2c_write(&mut self, addr: u8, _bytes: &[u8]) -> Result<(), HwError> {
-        if SIM_I2C.contains(&addr) { Ok(()) } else { Err(HwError::Nack) }
+    async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {
+        if !SIM_I2C.contains(&addr) {
+            return Err(HwError::Nack);
+        }
+        self.i2c_cmd[addr as usize & 0x7F] = bytes.to_vec();
+        Ok(())
     }
 
     async fn i2c_read(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), HwError> {
+        use yanarkaze_core::env::crc8;
         if !SIM_I2C.contains(&addr) {
             return Err(HwError::Nack);
         }
         buf.fill(0);
+        let cmd = self.i2c_cmd[addr as usize & 0x7F].as_slice();
+        let (temp, rh) = sim_room();
+        let mut data: Vec<u8> = match (addr, cmd) {
+            // SHT3x: status register, or a measurement.
+            (0x44, [0xF3, 0x2D]) => vec![0x80, 0x10],
+            (0x44, [0x24, 0x00]) => {
+                let st = ((temp + 45.0) / 175.0 * 65535.0) as u16;
+                let srh = (rh / 100.0 * 65535.0) as u16;
+                [st.to_be_bytes(), srh.to_be_bytes()].concat()
+            }
+            (0x44, _) => return Err(HwError::Nack), // nothing to read without a command
+            // AHT20: calibrated and idle, plus the measurement after 0xAC 0x33 0x00.
+            (0x38, [0xAC, 0x33, 0x00]) => {
+                let srh = (rh / 100.0 * 1048576.0) as u32;
+                let st = ((temp + 50.0) / 200.0 * 1048576.0) as u32;
+                vec![
+                    0x18,
+                    (srh >> 12) as u8,
+                    (srh >> 4) as u8,
+                    ((srh << 4) as u8 & 0xF0) | ((st >> 16) as u8 & 0x0F),
+                    (st >> 8) as u8,
+                    st as u8,
+                ]
+            }
+            (0x38, _) => vec![0x18],
+            _ => vec![],
+        };
+        // Sensirion puts a CRC after every word, Aosong one after the whole frame.
+        if addr == 0x44 {
+            data = data.chunks(2).flat_map(|w| [w[0], w[1], crc8(w)]).collect();
+        } else if addr == 0x38 && data.len() == 6 {
+            data.push(crc8(&data));
+        }
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
         Ok(())
     }
 
     async fn i2c_write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), HwError> {
-        self.i2c_read(addr, buf).await?;
-        if addr == 0x76 && bytes == [0xD0] {
-            buf[0] = 0x60; // BME280 chip ID register
+        if !SIM_I2C.contains(&addr) {
+            return Err(HwError::Nack);
+        }
+        buf.fill(0);
+        if let (0x76, [reg]) = (addr, bytes) {
+            let regs = sim_bme280_regs();
+            let start = *reg as usize;
+            let n = buf.len().min(256 - start);
+            buf[..n].copy_from_slice(&regs[start..start + n]);
         }
         Ok(())
     }

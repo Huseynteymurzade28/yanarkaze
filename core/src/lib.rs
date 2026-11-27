@@ -16,6 +16,7 @@
 mod term;
 mod calc;
 mod editor;
+pub mod env;
 mod fun;
 mod game2048;
 mod hw;

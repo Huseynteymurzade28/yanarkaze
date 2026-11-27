@@ -308,6 +308,53 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         self.term.print("\r\n").await;
     }
 
+    pub(crate) async fn cmd_env<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
+        let watch = args.next() == Some("watch");
+        let sensors = crate::env::detect(&mut self.sys).await;
+        if sensors.is_empty() {
+            self.term.print("no room sensor found: BME280 / BMP280 at 0x76 or 0x77, SHT3x at 0x44 or\r\n").await;
+            self.term.print("0x45, AHT20 at 0x38. 'i2c scan' shows what is on the bus.\r\n").await;
+            return;
+        }
+        if watch {
+            self.term.print("live, every second (any key stops)\r\n").await;
+        }
+        let mut on_oled = self.oled_ready;
+        for round in 0u32.. {
+            if round > 0 {
+                out!(self.term, "\x1b[{}A", sensors.len()); // back over the previous lines
+            }
+            let mut shown = false;
+            for &sensor in &sensors {
+                out!(self.term, "\r{} at 0x{:02x}: ", sensor.kind.name(), sensor.addr);
+                match crate::env::read(&mut self.sys, sensor).await {
+                    Ok(r) => {
+                        out!(self.term, "{:.2} C", r.temp_c);
+                        if let Some(rh) = r.humidity {
+                            out!(self.term, "  {rh:.1} %RH");
+                        }
+                        if let Some(hpa) = r.pressure_hpa {
+                            out!(self.term, "  {hpa:.1} hPa");
+                        }
+                        if on_oled && !shown {
+                            shown = true;
+                            let mut title: String<20> = String::new();
+                            let _ = write!(title, "{} at 0x{:02x}", sensor.kind.name(), sensor.addr);
+                            crate::screens::env(&mut self.oled, &title, &r);
+                            self.oled_mirror(&mut on_oled).await;
+                        }
+                    }
+                    Err(e) => out!(self.term, "error: {e}"),
+                }
+                self.term.print("\x1b[K\r\n").await;
+            }
+            self.term.flush().await;
+            if !watch || self.key_or_timeout(1000).await {
+                break;
+            }
+        }
+    }
+
     pub(crate) async fn cmd_i2c<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         const USAGE: &str = "i2c scan | read <addr> <reg> [n] | write <addr> <byte>... | speed <khz> | reset";
         match args.next() {

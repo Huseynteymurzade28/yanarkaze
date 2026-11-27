@@ -153,6 +153,34 @@ pub fn gauge(d: &mut Display, label: &str, value: &str, fraction: f32) {
     d.text((WIDTH as i32 - w) / 2, HEIGHT as i32 - 15, value, 2);
 }
 
+// ---------------------------------------------------------------------------
+// env
+// ---------------------------------------------------------------------------
+
+/// A room sensor reading: `title` small on top, the temperature big, then humidity and
+/// pressure when the sensor has them.
+pub fn env(d: &mut Display, title: &str, reading: &crate::env::EnvReading) {
+    d.clear();
+    let centred = |d: &mut Display, y: i32, text: &str, scale: i32| {
+        let w = text.chars().count() as i32 * CHAR_W as i32 * scale - scale;
+        d.text((WIDTH as i32 - w) / 2, y, text, scale);
+    };
+    centred(d, 0, title, 1);
+    let mut line: String<16> = String::new();
+    let _ = write!(line, "{:.1}{}C", reading.temp_c, crate::oled::DEGREE);
+    centred(d, 11, &line, 3);
+    if let Some(rh) = reading.humidity {
+        line.clear();
+        let _ = write!(line, "{rh:.0}% RH");
+        centred(d, 36, &line, 2);
+    }
+    if let Some(hpa) = reading.pressure_hpa {
+        line.clear();
+        let _ = write!(line, "{hpa:.1} hPa");
+        centred(d, 56, &line, 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -238,6 +266,10 @@ mod tests {
         std::println!("{}", ascii(&d));
         let mut d = Display::new();
         gauge(&mut d, "PA0 knob", "62%", 0.62);
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        let r = crate::env::EnvReading { temp_c: 22.43, humidity: Some(45.2), pressure_hpa: Some(1013.25) };
+        env(&mut d, "BME280 at 0x76", &r);
         std::println!("{}", ascii(&d));
     }
 }
