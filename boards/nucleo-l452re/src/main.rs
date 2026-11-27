@@ -9,6 +9,7 @@
 //!   RNG      -> hardware TRNG (48 MHz from HSI48)
 //!   I2C      -> I2C1 on Arduino D15 (SCL, PB8) and D14 (SDA: PB9, or PB7 on the -P board)
 //!   pins     -> GPIO, ADC1 and TIM2 PWM on the Arduino pins that are the same on both boards
+//!   settings -> the last 2 KiB flash page
 
 #![no_std]
 #![no_main]
@@ -23,6 +24,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::adc::{Adc, AdcChannel, AnyAdcChannel, SampleTime, Temperature, VrefInt};
 use embassy_embedded_hal::SetConfig;
 use embassy_stm32::exti::{self, ExtiInput};
+use embassy_stm32::flash::{self, FLASH_BASE, FLASH_SIZE, Flash, WRITE_SIZE};
 use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
@@ -76,6 +78,22 @@ static INFO: BoardInfo = BoardInfo {
 // (A2, A3, D5, D7-D13 differ), and one firmware runs on both. So the shell only offers the
 // Arduino pins that are the same on both boards. Pin numbers are port * 16 + bit
 // (`PinStyle::Port`): PA0 = 0, PB3 = 19, PC1 = 33.
+
+/// Settings live in the last flash page (2 KiB on the STM32L452), far past the firmware.
+const SETTINGS_PAGE: u32 = 2048;
+const SETTINGS_OFFSET: u32 = FLASH_SIZE as u32 - SETTINGS_PAGE;
+
+/// Where the firmware image ends in flash: the initial values of `.data` are its last part.
+fn image_end() -> u32 {
+    unsafe extern "C" {
+        static __sidata: u8;
+        static __sdata: u8;
+        static __edata: u8;
+    }
+    // Taking the address of an extern static is safe; only the addresses are used.
+    let data_len = (&raw const __edata) as u32 - (&raw const __sdata) as u32;
+    (&raw const __sidata) as u32 + data_len
+}
 
 const PA: u8 = 0;
 const PB: u8 = 16;
@@ -271,6 +289,7 @@ struct NucleoSystem {
     /// GPIOB pin number of SDA: 9 on the NUCLEO-L452RE, 7 on the NUCLEO-L452RE-P.
     sda: usize,
     adc: &'static SharedAdc,
+    flash: Flash<'static, flash::Blocking>,
 }
 
 impl NucleoSystem {
@@ -462,6 +481,28 @@ impl System for NucleoSystem {
         Ok((raw * vdda_mv / 4095.0) as u32)
     }
 
+    fn settings_load(&mut self, buf: &mut [u8]) -> Result<(), HwError> {
+        let n = buf.len().min(SETTINGS_PAGE as usize);
+        self.flash.blocking_read(SETTINGS_OFFSET, &mut buf[..n]).map_err(|_| HwError::Bus)
+    }
+
+    fn settings_store(&mut self, data: &[u8]) -> Result<(), HwError> {
+        // Never erase a page the program lives in, should the firmware ever grow that far.
+        if image_end() > FLASH_BASE as u32 + SETTINGS_OFFSET || data.len() > SETTINGS_PAGE as usize {
+            return Err(HwError::OutOfRange);
+        }
+        let end = SETTINGS_OFFSET + SETTINGS_PAGE;
+        self.flash.blocking_erase(SETTINGS_OFFSET, end).map_err(|_| HwError::Bus)?;
+        // The flash is programmed 8 bytes at a time; the tail is padded with the erased value.
+        for (i, chunk) in data.chunks(WRITE_SIZE).enumerate() {
+            let mut word = [0xFFu8; WRITE_SIZE];
+            word[..chunk.len()].copy_from_slice(chunk);
+            let offset = SETTINGS_OFFSET + (i * WRITE_SIZE) as u32;
+            self.flash.blocking_write(offset, &word).map_err(|_| HwError::Bus)?;
+        }
+        Ok(())
+    }
+
     fn i2c_pins(&self) -> Option<&'static str> {
         Some(if self.sda == 7 {
             "SDA D14 = PB7, SCL D15 = PB8, the two pins above AREF"
@@ -482,6 +523,11 @@ impl System for NucleoSystem {
         self.recover_bus()
     }
 
+    // Blocking on purpose. DMA I2C was tried on embassy-stm32 0.6 and fails two ways: the
+    // DMA read never notices a NACK (it waits out the timeout, so every empty address in a
+    // scan reads as a bus error), and with the I2C interrupts bound the blocking calls report
+    // each result one transfer late (the OLED shows up at 0x3d). A transfer takes at most
+    // ~25 ms (a whole OLED frame at 400 kHz), and console input waits safely in its DMA ring.
     async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {
         let r = self.i2c.blocking_write(addr, bytes);
         self.i2c_result(r)
@@ -604,11 +650,7 @@ async fn main(spawner: Spawner) {
     let wdg = Iwdg(IndependentWatchdog::new(p.IWDG, 2_000_000)); // 2 s timeout
     // I2C1 on the Arduino header's SCL/SDA (D15/D14). The internal pull-ups are weak
     // (about 40k); most OLED modules bring their own, which is what makes 400 kHz work.
-    //
-    // Blocking: with I2C1 on DMA2 (DMA1 channels 6 and 7 are the console's) the console
-    // froze right at boot. That was probably the lost-TC bug `ConsoleTx` works around, but
-    // DMA I2C has not been retried since. A full OLED frame at 400 kHz holds the executor
-    // for about 25 ms; console input is safe meanwhile in its DMA ring buffer.
+    // Blocking: see the note above `i2c_write` for why not DMA.
     let mut i2c_config = i2c::Config::default();
     i2c_config.frequency = Hertz(400_000);
     i2c_config.sda_pullup = true;
@@ -625,7 +667,8 @@ async fn main(spawner: Spawner) {
     static ADC: StaticCell<SharedAdc> = StaticCell::new();
     let adc_pins = [p.PA0.degrade_adc(), p.PA1.degrade_adc(), p.PC1.degrade_adc(), p.PC0.degrade_adc()];
     let adc = &*ADC.init(Mutex::new(AdcBank::new(p.ADC1, adc_pins).await));
-    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc };
+    let flash = Flash::new_blocking(p.FLASH);
+    let sys = NucleoSystem { rng: Rng::new(p.RNG, Irqs), reset_reason, i2c, sda, adc, flash };
 
     spawner.spawn(shell_task(sys, uart_rx, ConsoleTx(uart_tx), spawner).unwrap());
     spawner.spawn(led_task(led).unwrap());
