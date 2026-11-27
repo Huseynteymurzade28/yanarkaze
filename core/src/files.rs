@@ -34,6 +34,11 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     pub(crate) async fn run_redirected(&mut self, cmd: &str, file: &str, append: bool) {
         self.term.start_capture();
         self.run_part(cmd).await;
+        self.finish_redirect(file, append).await;
+    }
+
+    /// Ends the capture `start_capture` began and writes what it caught into `file`.
+    pub(crate) async fn finish_redirect(&mut self, file: &str, append: bool) {
         let Some(capture) = self.term.end_capture() else { return };
         let result = match ember(&mut self.sys) {
             Ok(mut fs) if append => fs.append(file, &capture.text).await,

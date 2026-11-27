@@ -26,6 +26,7 @@ mod logcmd;
 mod oled;
 mod scope;
 mod screens;
+mod script;
 pub mod settings;
 mod snake;
 mod state;

@@ -130,6 +130,7 @@ Files (ember, in flash: NUCLEO and the simulator):
   mv <file> <name>     rename a file
   df                   how much room the files take
   format yes           erase every file and start ember afresh
+  run <file> [args]    run a script (or just type its name: boot runs boot.ynk)
   edit <file>          full-screen editor: arrows, Home/End, PgUp/PgDn; ^S saves, ^X quits
 
 Fun:
@@ -197,6 +198,18 @@ NUCLEO, 32 files of up to 8 KB) on top of
 [sequential-storage](https://github.com/tweedegolf/sequential-storage), which spreads the
 wear and survives a reset in the middle of a write. Names start with a letter, so `calc 256
 >> 2` is still a shift.
+
+Scripts are files of command lines, named `.ynk`. Each line runs as if typed (aliases, `;`,
+`>` and `>>` included), `#` starts a comment, `$1`..`$9` and `$*` are the arguments and `$0`
+the script's own name. A script can run other scripts (four deep), a key stops it, and the
+menu lists them, so the board can run them on its own:
+
+```
+yanarkaze> edit greet.ynk              # echo hello $1; temp
+yanarkaze> greet Ayse                  -> hello Ayse, then the temperature
+yanarkaze> autorun greet world; save   -> runs at every boot
+yanarkaze> run greet Ayse > out.txt    -> what it printed, in a file
+```
 
 The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
 are stored on the NUCLEO (last flash page) and in the simulator (`~/.yanarkaze-settings`, or

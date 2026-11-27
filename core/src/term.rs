@@ -12,6 +12,8 @@ pub struct Term<W: Write> {
     tx: W,
     /// While a command's output goes to a file instead: the text so far.
     capture: Option<Capture>,
+    /// The capture a nested one interrupted (`run x.ynk > a` with `temp > b` inside).
+    outer: Option<Capture>,
 }
 
 /// Output being collected for a file: plain text, without the colours and cursor moves
@@ -60,16 +62,25 @@ impl Capture {
 
 impl<W: Write> Term<W> {
     pub fn new(tx: W) -> Self {
-        Self { tx, capture: None }
+        Self { tx, capture: None, outer: None }
     }
 
-    /// From now on, output is collected instead of sent, until [`Self::end_capture`].
+    /// From now on, output is collected instead of sent, until [`Self::end_capture`]. One
+    /// capture can nest inside another; deeper ones are not kept apart.
     pub fn start_capture(&mut self) {
-        self.capture = Some(Capture { text: heapless::Vec::new(), overflowed: false, escape: Escape::None });
+        let new = Capture { text: heapless::Vec::new(), overflowed: false, escape: Escape::None };
+        if self.outer.is_none() {
+            self.outer = self.capture.replace(new);
+        } else {
+            self.capture = Some(new);
+        }
     }
 
+    /// Stops the innermost capture and returns it; output goes back to where it went before.
     pub fn end_capture(&mut self) -> Option<Capture> {
-        self.capture.take()
+        let ended = self.capture.take();
+        self.capture = self.outer.take();
+        ended
     }
 
     pub async fn write_bytes(&mut self, bytes: &[u8]) {

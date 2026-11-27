@@ -118,6 +118,7 @@ pub(crate) const FILE_COMMANDS: &[Command] = &[
     cmd("df", "", "how much room the files take"),
     cmd("edit", "<file>", "full-screen editor: arrows move, ^S saves, ^X quits"),
     cmd("format", "yes", "erase every file and start ember afresh"),
+    cmd("run", "<file> [args]", "run a script: a command per line, # comments, $1..$9 (or just: boot)"),
 ];
 
 pub(crate) const FUN_COMMANDS: &[Command] = &[
@@ -164,6 +165,11 @@ const COMMAND_NAMES: [&str; COMMAND_COUNT] = {
 
 fn all_commands() -> impl Iterator<Item = &'static Command> {
     SECTIONS.iter().flat_map(|(_, table)| table.iter())
+}
+
+/// A built-in command's name (scripts and aliases do not count).
+pub(crate) fn is_command(name: &str) -> bool {
+    COMMAND_NAMES.contains(&name)
 }
 
 pub(crate) fn find_command(name: &str) -> Option<&'static Command> {
@@ -493,9 +499,21 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
         };
         for part in line.split(';').map(str::trim).filter(|p| !p.is_empty()) {
-            match crate::files::split_redirect(part) {
-                (cmd, Some((file, append))) => self.run_redirected(cmd, file, append).await,
-                (cmd, None) => self.run_part(cmd).await,
+            let (cmd, redirect) = crate::files::split_redirect(part);
+            if let Some((script, args)) = self.script_of(cmd).await {
+                match redirect {
+                    Some((file, append)) => {
+                        self.term.start_capture();
+                        self.run_script(&script, &args).await;
+                        self.finish_redirect(file, append).await;
+                    }
+                    None => self.run_script(&script, &args).await,
+                }
+                continue;
+            }
+            match redirect {
+                Some((file, append)) => self.run_redirected(cmd, file, append).await,
+                None => self.run_part(cmd).await,
             }
         }
     }
@@ -540,7 +558,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         const TITLE: &str = "tap: next  hold: run";
         type Label = heapless::String<16>;
         type Line = heapless::String<24>;
-        let mut items: heapless::Vec<(Label, Line), 16> = heapless::Vec::new();
+        let mut items: heapless::Vec<(Label, Line), 20> = heapless::Vec::new();
         let mut add = |label: &str, cmd: &str| {
             let _ = items.push((label.try_into().unwrap_or_default(), cmd.try_into().unwrap_or_default()));
         };
@@ -568,6 +586,19 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         if self.sys.flash_area(crate::platform::Area::Log).is_some() {
             add("log chart", "log show");
         }
+        // The scripts, so the board can run them on its own.
+        let scripts = match crate::files::ember(&mut self.sys) {
+            Ok(mut fs) => fs.list().await.unwrap_or_default(),
+            Err(_) => heapless::Vec::new(),
+        };
+        for f in scripts.iter().filter(|f| f.name.ends_with(crate::script::EXTENSION)).take(4) {
+            let stem = &f.name[..f.name.len() - crate::script::EXTENSION.len()];
+            let mut label = Label::new();
+            let mut cmd = Line::new();
+            let _ = write!(label, "> {}", stem.get(..14).unwrap_or(stem));
+            let _ = write!(cmd, "run {}", f.name.as_str());
+            add(&label, &cmd);
+        }
         add("life", "oled life");
         add("dashboard", "oled dash");
         add("logo", "oled logo");
@@ -585,7 +616,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut selected = 0;
         loop {
             // Show the menu.
-            let labels: heapless::Vec<&str, 16> = items.iter().map(|(l, _)| l.as_str()).collect();
+            let labels: heapless::Vec<&str, 20> = items.iter().map(|(l, _)| l.as_str()).collect();
             out!(self.term, "\r> {}  ({}/{})\x1b[K", labels[selected], selected + 1, labels.len());
             self.term.flush().await;
             if on_oled {
@@ -813,6 +844,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.
             "repeat" | "every" => self.term.print("repeat and every cannot be nested\r\n").await,
             "menu" => self.term.print("the menu runs commands itself, so it cannot run inside one\r\n").await,
+            "run" => self.term.print("run cannot go inside repeat or every (a script can use them)\r\n").await,
             "alert" => match args.next().and_then(|v| v.parse::<f32>().ok()) {
                 Some(c) => {
                     ALERT_MILLI_C.store((c * 1000.0) as i32, Ordering::Relaxed);
