@@ -5,7 +5,7 @@
 
 use heapless::Deque;
 
-use crate::oled::{Display, CHAR_W};
+use crate::oled::{CHAR_W, Display};
 
 pub const W: u8 = 24;
 pub const H: u8 = 14;

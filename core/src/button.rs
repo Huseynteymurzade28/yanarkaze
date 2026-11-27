@@ -5,7 +5,9 @@ use embassy_time::{Instant, Timer};
 use portable_atomic::Ordering;
 
 use crate::platform::Button;
-use crate::state::{BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, LedMode, STAT_BUTTON, set_led_mode};
+use crate::state::{
+    BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, LedMode, STAT_BUTTON, set_led_mode,
+};
 
 const DEBOUNCE_MS: u64 = 20;
 /// A press only counts once the pin has stayed down this long, so short contacts are

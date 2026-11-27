@@ -423,11 +423,12 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let term_unit: String<4> = unit.chars().map(|c| if c == oled::DEGREE { ' ' } else { c }).collect();
 
         let mut on_oled = self.oled_init().await.is_ok();
-        out!(self.term, "{} every {period} ms, {} (any key stops)\r\n", title.as_str(), if on_oled {
-            "chart on the OLED"
-        } else {
-            "numbers only: the chart needs the OLED"
-        });
+        out!(
+            self.term,
+            "{} every {period} ms, {} (any key stops)\r\n",
+            title.as_str(),
+            if on_oled { "chart on the OLED" } else { "numbers only: the chart needs the OLED" }
+        );
         let mut series = Series::new();
         let mut next = embassy_time::Instant::now();
         loop {
@@ -482,7 +483,9 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             // Keep the pace even though reading and drawing take time of their own.
             next += embassy_time::Duration::from_millis(period);
             let now = embassy_time::Instant::now();
-            let wait = if next > now { (next - now).as_millis() } else {
+            let wait = if next > now {
+                (next - now).as_millis()
+            } else {
                 next = now;
                 1
             };

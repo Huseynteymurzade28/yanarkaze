@@ -20,17 +20,17 @@ use core::fmt::Write as _;
 
 use cortex_m::peripheral::DWT;
 use defmt::info;
+use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_stm32::adc::{Adc, AdcChannel, AnyAdcChannel, SampleTime, Temperature, VrefInt};
-use embassy_embedded_hal::SetConfig;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::flash::{self, FLASH_BASE, FLASH_SIZE, Flash, WRITE_SIZE};
-use embassy_stm32::i2c::{self, I2c};
-use embassy_stm32::time::Hertz;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::i2c::{self, I2c};
 use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::peripherals::{ADC1, IWDG, RNG};
 use embassy_stm32::rng::{self, Rng};
+use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{self, RingBufferedUartRx, Uart, UartTx};
 use embassy_stm32::wdg::IndependentWatchdog;
 use embassy_stm32::{Config, Peri, bind_interrupts, interrupt, pac, peripherals};
@@ -181,19 +181,11 @@ struct UserButton {
 
 impl Button for UserButton {
     async fn wait_for_press(&mut self) {
-        if self.active_high {
-            self.pin.wait_for_rising_edge().await
-        } else {
-            self.pin.wait_for_falling_edge().await
-        }
+        if self.active_high { self.pin.wait_for_rising_edge().await } else { self.pin.wait_for_falling_edge().await }
     }
 
     async fn wait_for_release(&mut self) {
-        if self.active_high {
-            self.pin.wait_for_low().await
-        } else {
-            self.pin.wait_for_high().await
-        }
+        if self.active_high { self.pin.wait_for_low().await } else { self.pin.wait_for_high().await }
     }
 }
 

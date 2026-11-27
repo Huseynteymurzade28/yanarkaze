@@ -2,7 +2,7 @@
 //!
 //! Tiles are stored as exponents (1 = 2, 2 = 4, ... 11 = 2048), so a whole board is 16 bytes.
 
-use crate::oled::{Display, CHAR_W};
+use crate::oled::{CHAR_W, Display};
 
 pub const N: usize = 4;
 

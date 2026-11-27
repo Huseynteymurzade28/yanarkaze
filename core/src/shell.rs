@@ -12,12 +12,12 @@ use portable_atomic::Ordering;
 use crate::editor::{Editor, Out};
 use crate::oled::Display;
 use crate::platform::System;
+use crate::settings::{self, Settings};
 use crate::state::{
-    ALERT_MILLI_C, BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, GAME_ACTIVE, Event, HISTORY_SECS, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS,
-    TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
+    ALERT_MILLI_C, BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, HISTORY_SECS, LedMode,
+    MORSE_MAX, SAMPLE, STAT_SHELL, STATS, TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
 };
 use crate::term::Term;
-use crate::settings::{self, Settings};
 use crate::{VERSION, calc, fun, screens};
 
 const PROMPT: &str = "\x1b[1;38;5;208myanarkaze\x1b[0m\x1b[1;38;5;51m>\x1b[0m ";
@@ -511,9 +511,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         add("exit", "");
 
         let mut on_oled = self.oled_init().await.is_ok();
-        self.term
-            .print("menu: tap the button for the next item, hold it to run; or arrows, Enter, q\r\n")
-            .await;
+        self.term.print("menu: tap the button for the next item, hold it to run; or arrows, Enter, q\r\n").await;
         if !on_oled {
             self.term.print("(no OLED: the menu is only here in the terminal)\r\n").await;
         }
