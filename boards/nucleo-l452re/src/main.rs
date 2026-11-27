@@ -82,6 +82,9 @@ static INFO: BoardInfo = BoardInfo {
 /// Settings live in the last flash page (2 KiB on the STM32L452), far past the firmware.
 const SETTINGS_PAGE: u32 = 2048;
 const SETTINGS_OFFSET: u32 = FLASH_SIZE as u32 - SETTINGS_PAGE;
+/// The temperature log: the 16 pages (32 KB, 4096 records) below the settings.
+const LOG_PAGES: u32 = 16;
+const LOG_OFFSET: u32 = SETTINGS_OFFSET - LOG_PAGES * SETTINGS_PAGE;
 
 /// Where the firmware image ends in flash: the initial values of `.data` are its last part.
 fn image_end() -> u32 {
@@ -486,9 +489,63 @@ impl System for NucleoSystem {
         Ok((raw * vdda_mv / 4095.0) as u32)
     }
 
+    /// Paced by the cycle counter, so samples are evenly spaced down to a few microseconds.
+    /// Captures with more than a millisecond between samples use the async timer instead,
+    /// rather than block the executor for a long time.
+    async fn adc_capture(&mut self, pin: u8, buf: &mut [u16], interval_us: u32) -> Result<u32, HwError> {
+        if interval_us > 1000 {
+            let start = embassy_time::Instant::now();
+            for v in buf.iter_mut() {
+                *v = self.adc_read(pin).await? as u16;
+                Timer::after_micros(interval_us as u64).await;
+            }
+            return Ok((start.elapsed().as_micros() * 1000 / buf.len().max(1) as u64) as u32);
+        }
+        self.check_pin(pin, |p| p.adc)?;
+        let index = ADC_PINS.iter().position(|&p| p == pin).ok_or(HwError::WrongPin)?;
+        Self::set_mode(pin, pac::gpio::vals::Moder::ANALOG);
+        let mut bank = self.adc.lock().await;
+        let scale = bank.vdda_mv() / 4095.0;
+        let bank = &mut *bank;
+        let step = interval_us * CPU_MHZ;
+        let start = DWT::cycle_count();
+        let mut next = start;
+        for v in buf.iter_mut() {
+            // Wrapping arithmetic: the counter rolls over every 53 s at 80 MHz.
+            while (DWT::cycle_count().wrapping_sub(next) as i32) < 0 {}
+            next = next.wrapping_add(step);
+            // 12.5 cycles of sampling: fast, and fine for a source like a PWM pin or a
+            // potentiometer (low impedance).
+            let raw = bank.adc.blocking_read(&mut bank.pins[index], SampleTime::CYCLES12_5) as f32;
+            *v = (raw * scale) as u16;
+        }
+        let cycles = DWT::cycle_count().wrapping_sub(start) as u64;
+        Ok((cycles * 1000 / CPU_MHZ as u64 / buf.len().max(1) as u64) as u32)
+    }
+
     fn settings_load(&mut self, buf: &mut [u8]) -> Result<(), HwError> {
         let n = buf.len().min(SETTINGS_PAGE as usize);
         self.flash.blocking_read(SETTINGS_OFFSET, &mut buf[..n]).map_err(|_| HwError::Bus)
+    }
+
+    fn log_geometry(&self) -> Option<(usize, usize)> {
+        // Only if the program stays clear of it, should the firmware ever grow that far.
+        (image_end() <= FLASH_BASE as u32 + LOG_OFFSET).then_some((LOG_PAGES as usize, SETTINGS_PAGE as usize))
+    }
+
+    fn log_read(&mut self, offset: usize, buf: &mut [u8; 8]) -> Result<(), HwError> {
+        let offset = Self::log_offset(offset, 8)?;
+        self.flash.blocking_read(offset, buf).map_err(|_| HwError::Bus)
+    }
+
+    fn log_write(&mut self, offset: usize, record: &[u8; 8]) -> Result<(), HwError> {
+        let offset = Self::log_offset(offset, WRITE_SIZE)?;
+        self.flash.blocking_write(offset, record).map_err(|_| HwError::Bus)
+    }
+
+    fn log_erase(&mut self, page: usize) -> Result<(), HwError> {
+        let start = Self::log_offset(page * SETTINGS_PAGE as usize, SETTINGS_PAGE as usize)?;
+        self.flash.blocking_erase(start, start + SETTINGS_PAGE).map_err(|_| HwError::Bus)
     }
 
     fn settings_store(&mut self, data: &[u8]) -> Result<(), HwError> {
@@ -546,6 +603,18 @@ impl System for NucleoSystem {
     async fn i2c_write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), HwError> {
         let r = self.i2c.blocking_write_read(addr, bytes, buf);
         self.i2c_result(r)
+    }
+}
+
+impl NucleoSystem {
+    /// Checks that `len` bytes at `offset` in the log area stay inside it; returns the offset
+    /// from the start of flash.
+    fn log_offset(offset: usize, len: usize) -> Result<u32, HwError> {
+        let size = (LOG_PAGES * SETTINGS_PAGE) as usize;
+        if image_end() > FLASH_BASE as u32 + LOG_OFFSET || offset + len > size {
+            return Err(HwError::OutOfRange);
+        }
+        Ok(LOG_OFFSET + offset as u32)
     }
 }
 

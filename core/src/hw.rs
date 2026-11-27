@@ -496,6 +496,81 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         self.term.print("\r\n").await;
     }
 
+    pub(crate) async fn cmd_scope<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
+        use crate::scope::{self, CAPTURE, WINDOW};
+        const USAGE: &str = "scope <adc pin> [us per sample] [trigger mV]   e.g. scope A0 20";
+        let Some(pin) = self.pin_arg(args.next(), USAGE).await else { return };
+        let mut interval_us = args.next().and_then(|v| v.parse::<u32>().ok()).map_or(20, |v| v.clamp(5, 10_000));
+        let level_mv = args.next().and_then(|v| v.parse::<u16>().ok());
+        let name = self.pin_name(pin);
+        let mut on_oled = self.oled_init().await.is_ok();
+        out!(
+            self.term,
+            "scope on {name}: + and - change the time base, any other key stops{}\r\n",
+            if on_oled { "" } else { " (no OLED: numbers only)" }
+        );
+        let mut buf = [0u16; CAPTURE];
+        loop {
+            let interval_ns = match self.sys.adc_capture(pin, &mut buf, interval_us).await {
+                Ok(ns) => ns.max(1),
+                Err(e) => {
+                    self.hw_error(e).await;
+                    return;
+                }
+            };
+            let a = scope::analyze(&buf, interval_ns, level_mv);
+            let mut freq: String<10> = String::new();
+            match a.freq_hz {
+                Some(f) if f < 10.0 => write!(freq, "{f:.2}Hz"),
+                Some(f) if f < 1000.0 => write!(freq, "{f:.0}Hz"),
+                Some(f) if f < 10_000.0 => write!(freq, "{:.2}kHz", f / 1000.0),
+                Some(f) => write!(freq, "{:.1}kHz", f / 1000.0),
+                None => write!(freq, "no trig"),
+            }
+            .ok();
+            let vpp = (a.max_mv - a.min_mv) as f32 / 1000.0;
+            // One division is 16 samples.
+            let div_us = 16 * interval_ns as u64 / 1000;
+            let mut div: String<8> = String::new();
+            let _ = if div_us < 1000 { write!(div, "{div_us}us") } else { write!(div, "{}ms", div_us / 1000) };
+            let mut duty: String<12> = String::new();
+            if let Some(dc) = a.duty {
+                let _ = write!(duty, " duty {:.0}%", dc * 100.0);
+            }
+            out!(
+                self.term,
+                "\r{name}: {}{}  {vpp:.2} Vpp ({}-{} mV)  {}/div, {:.1} us/sample\x1b[K",
+                freq.as_str(),
+                duty.as_str(),
+                a.min_mv,
+                a.max_mv,
+                div.as_str(),
+                interval_ns as f32 / 1000.0
+            );
+            self.term.flush().await;
+            if on_oled {
+                let start = a.start.unwrap_or(0);
+                let mut header: String<24> = String::new();
+                let _ = write!(header, "{} {vpp:.1}V {}", freq.as_str(), div.as_str());
+                let level = a.start.map(|_| a.level_mv);
+                crate::screens::scope(&mut self.oled, &header, &buf[start..start + WINDOW], 3300, level);
+                self.oled_mirror(&mut on_oled).await;
+            }
+            match self.key_or_timeout_byte(100).await {
+                None => {}
+                Some(b'+' | b'=') => interval_us = scope::step_interval(interval_us, true),
+                Some(b'-' | b'_') => interval_us = scope::step_interval(interval_us, false),
+                Some(_) => {
+                    if self.in_menu {
+                        self.menu_stopped = true;
+                    }
+                    break;
+                }
+            }
+        }
+        self.term.print("\r\n").await;
+    }
+
     pub(crate) async fn cmd_i2c<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         const USAGE: &str = "i2c scan | read <addr> <reg> [n] | write <addr> <byte>... | speed <khz> | reset";
         match args.next() {

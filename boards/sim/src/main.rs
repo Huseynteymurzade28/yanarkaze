@@ -228,6 +228,11 @@ struct SimSystem {
     levels: u32,
     /// The last bytes written to each fake I2C device: its pending command.
     i2c_cmd: [Vec<u8>; 128],
+    /// The last PWM output set (frequency, duty in 0.1 %), as if wired to every analog pin
+    /// for `scope`.
+    pwm: Option<(u32, u16)>,
+    /// The log file, read on first use.
+    log: Option<Vec<u8>>,
 }
 
 /// Pretend header: GP0-15 for gpio / pwm, GP26-28 analog.
@@ -254,6 +259,25 @@ fn sim_settings_path() -> std::path::PathBuf {
     match env::var_os("YANARKAZE_SETTINGS") {
         Some(path) => path.into(),
         None => env::home_dir().unwrap_or_default().join(".yanarkaze-settings"),
+    }
+}
+
+/// The temperature log's "flash": a file of `SIM_LOG_PAGES` pages, erased to 0xFF.
+const SIM_LOG_PAGES: usize = 16;
+const SIM_LOG_PAGE: usize = 2048;
+
+fn sim_log_path() -> std::path::PathBuf {
+    match env::var_os("YANARKAZE_LOG") {
+        Some(path) => path.into(),
+        None => env::home_dir().unwrap_or_default().join(".yanarkaze-log"),
+    }
+}
+
+/// The log file's bytes, created erased if it is missing or the wrong size.
+fn sim_log_bytes() -> Vec<u8> {
+    match std::fs::read(sim_log_path()) {
+        Ok(b) if b.len() == SIM_LOG_PAGES * SIM_LOG_PAGE => b,
+        _ => vec![0xFF; SIM_LOG_PAGES * SIM_LOG_PAGE],
     }
 }
 
@@ -320,6 +344,8 @@ impl SimSystem {
             regions: [MemRegion { start: rom, end: rom + SIM_ROM.len(), name: "simulated ROM" }],
             levels: 0,
             i2c_cmd: std::array::from_fn(|_| Vec::new()),
+            pwm: None,
+            log: None,
         }
     }
 }
@@ -380,7 +406,31 @@ impl System for SimSystem {
         if !(10..=1_000_000).contains(&freq_hz) || duty > 1000 {
             return Err(HwError::OutOfRange);
         }
+        self.pwm = (duty > 0).then_some((freq_hz, duty));
         Ok(freq_hz)
+    }
+
+    /// With a PWM output running, every analog pin sees it (as if wired with a jumper), with
+    /// a little noise and an RC-rounded edge; otherwise the knob.
+    async fn adc_capture(&mut self, pin: u8, buf: &mut [u16], interval_us: u32) -> Result<u32, HwError> {
+        sim_pin(pin, |p| p.adc)?;
+        let Some((freq, duty)) = self.pwm else {
+            let mv = self.adc_read(pin).await? as u16;
+            buf.fill(mv);
+            return Ok(interval_us * 1000);
+        };
+        let period_ns = 1e9 / freq as f64;
+        let t0 = (now_ms() * 1_000_000) as f64;
+        let mut level = 0.0f64;
+        for (i, v) in buf.iter_mut().enumerate() {
+            let t = t0 + i as f64 * interval_us as f64 * 1000.0;
+            let high = (t % period_ns) / period_ns < duty as f64 / 1000.0;
+            let target = if high { 3300.0 } else { 0.0 };
+            level += (target - level) * 0.8;
+            let noise = (self.rng.next_u32() % 30) as f64 - 15.0;
+            *v = (level + noise).clamp(0.0, 3300.0) as u16;
+        }
+        Ok(interval_us * 1000)
     }
 
     /// A knob that someone keeps turning slowly back and forth (a 6 s triangle wave).
@@ -416,6 +466,32 @@ impl System for SimSystem {
         let path = sim_settings_path();
         let result = if data.is_empty() { std::fs::remove_file(&path).or(Ok(())) } else { std::fs::write(&path, data) };
         result.map_err(|_| HwError::Bus)
+    }
+
+    fn log_geometry(&self) -> Option<(usize, usize)> {
+        Some((SIM_LOG_PAGES, SIM_LOG_PAGE))
+    }
+
+    fn log_read(&mut self, offset: usize, buf: &mut [u8; 8]) -> Result<(), HwError> {
+        let bytes = self.log.get_or_insert_with(sim_log_bytes);
+        buf.copy_from_slice(bytes.get(offset..offset + 8).ok_or(HwError::OutOfRange)?);
+        Ok(())
+    }
+
+    /// Like flash, a write can only clear bits; the file is rewritten each time.
+    fn log_write(&mut self, offset: usize, record: &[u8; 8]) -> Result<(), HwError> {
+        let bytes = self.log.get_or_insert_with(sim_log_bytes);
+        let word = bytes.get_mut(offset..offset + 8).ok_or(HwError::OutOfRange)?;
+        for (w, r) in word.iter_mut().zip(record) {
+            *w &= r;
+        }
+        std::fs::write(sim_log_path(), &*bytes).map_err(|_| HwError::Bus)
+    }
+
+    fn log_erase(&mut self, page: usize) -> Result<(), HwError> {
+        let bytes = self.log.get_or_insert_with(sim_log_bytes);
+        bytes.get_mut(page * SIM_LOG_PAGE..(page + 1) * SIM_LOG_PAGE).ok_or(HwError::OutOfRange)?.fill(0xFF);
+        std::fs::write(sim_log_path(), &*bytes).map_err(|_| HwError::Bus)
     }
 
     async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {

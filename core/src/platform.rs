@@ -202,6 +202,41 @@ pub trait System {
     }
 
     /// Where the I2C bus is, e.g. "SDA GP4 (pin 6), SCL GP5 (pin 7)".
+    /// Samples an analog pin `buf.len()` times, `interval_us` apart (or as fast as the board
+    /// can, if that is slower), in millivolts, for `scope`. Returns the interval it really
+    /// managed, in nanoseconds. Boards with a cycle counter should override this: the default
+    /// paces samples with the async timer, which is too coarse for fast signals.
+    async fn adc_capture(&mut self, pin: u8, buf: &mut [u16], interval_us: u32) -> Result<u32, HwError> {
+        let start = embassy_time::Instant::now();
+        for v in buf.iter_mut() {
+            *v = self.adc_read(pin).await?.min(u16::MAX as u32) as u16;
+            embassy_time::Timer::after_micros(interval_us as u64).await;
+        }
+        let elapsed_ns = start.elapsed().as_micros() * 1000;
+        Ok((elapsed_ns / buf.len().max(1) as u64).min(u32::MAX as u64) as u32)
+    }
+
+    /// Flash set aside for the temperature log: (pages, bytes per page). `None` (the default)
+    /// means the board has no room for one. See [`crate::log`].
+    fn log_geometry(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Reads 8 bytes at `offset` in the log area.
+    fn log_read(&mut self, _offset: usize, _buf: &mut [u8; 8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Writes 8 bytes at `offset` (8-aligned, erased since the last write).
+    fn log_write(&mut self, _offset: usize, _record: &[u8; 8]) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Erases page `page` of the log area to 0xFF.
+    fn log_erase(&mut self, _page: usize) -> Result<(), HwError> {
+        Err(HwError::Unsupported)
+    }
+
     fn i2c_pins(&self) -> Option<&'static str> {
         None
     }

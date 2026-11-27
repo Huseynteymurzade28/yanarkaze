@@ -18,7 +18,7 @@ pub const MAX_ALIASES: usize = 16;
 pub const NAME_LEN: usize = 16;
 pub const BODY_LEN: usize = 80;
 /// The largest blob [`Settings::encode`] produces (all aliases and the autorun at full length).
-pub const BLOB_MAX: usize = HEADER + MAX_ALIASES * (6 + NAME_LEN + 1 + BODY_LEN + 1) + 8 + BODY_LEN + 1;
+pub const BLOB_MAX: usize = HEADER + MAX_ALIASES * (6 + NAME_LEN + 1 + BODY_LEN + 1) + 8 + BODY_LEN + 1 + 16;
 
 const MAGIC: &[u8; 4] = b"YNKZ";
 const VERSION: u8 = 1;
@@ -29,6 +29,8 @@ pub struct Settings {
     pub aliases: Vec<(String<NAME_LEN>, String<BODY_LEN>), MAX_ALIASES>,
     /// Run once at boot; empty for none.
     pub autorun: String<BODY_LEN>,
+    /// Seconds between temperature log records; 0 when the log is off.
+    pub log_secs: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +115,10 @@ impl Settings {
             put(&self.autorun);
             put("\n");
         }
+        let mut log: String<16> = String::new();
+        if self.log_secs > 0 && core::fmt::Write::write_fmt(&mut log, format_args!("log {}\n", self.log_secs)).is_ok() {
+            put(&log);
+        }
         let text_len = len - HEADER;
         out[0..4].copy_from_slice(MAGIC);
         out[4] = VERSION;
@@ -144,6 +150,7 @@ impl Settings {
                 "autorun" => {
                     let _ = settings.set_autorun(rest);
                 }
+                "log" => settings.log_secs = rest.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -250,6 +257,7 @@ mod tests {
     fn round_trip() {
         let mut s = with(&[("blink", "repeat 5 led toggle"), ("hot", "alert 30; temp")]);
         s.set_autorun("led heartbeat; oled dash").unwrap();
+        s.log_secs = 60;
         let mut blob = [0u8; BLOB_MAX];
         let n = s.encode(&mut blob);
         assert_eq!(Settings::decode(&blob[..n]), Some(s.clone()));

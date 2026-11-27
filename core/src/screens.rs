@@ -307,6 +307,52 @@ pub fn plot(d: &mut Display, title: &str, series: &Series, scale: Scale, decimal
 }
 
 // ---------------------------------------------------------------------------
+// scope
+// ---------------------------------------------------------------------------
+
+/// Top and bottom rows of the scope's trace (0 V at the bottom, `full_mv` at the top).
+const SCOPE_TOP: i32 = 11;
+const SCOPE_BOTTOM: i32 = 63;
+
+/// An oscilloscope screen: `window` (one sample per column) over a grid of 16-pixel
+/// divisions, the trigger level as a tick on the left, and `header` in the bar on top.
+pub fn scope(d: &mut Display, header: &str, window: &[u16], full_mv: u16, level_mv: Option<u16>) {
+    d.clear();
+    d.text(1, 1, header, 1);
+    d.invert_rect(0, 0, WIDTH as i32, 10);
+    let row = |mv: u16| {
+        let fraction = (mv as f32 / full_mv as f32).clamp(0.0, 1.0);
+        SCOPE_BOTTOM - (fraction * (SCOPE_BOTTOM - SCOPE_TOP) as f32 + 0.5) as i32
+    };
+    // Grid: dots every 4 pixels on the division lines, 4 divisions high.
+    for x in (0..WIDTH as i32).step_by(16) {
+        for y in (SCOPE_TOP..=SCOPE_BOTTOM).step_by(4) {
+            d.set(x, y, true);
+        }
+    }
+    for i in 0..=4 {
+        let y = SCOPE_BOTTOM - i * (SCOPE_BOTTOM - SCOPE_TOP) / 4;
+        for x in (0..WIDTH as i32).step_by(4) {
+            d.set(x, y, true);
+        }
+    }
+    if let Some(level) = level_mv {
+        let y = row(level);
+        d.line(0, y, 3, y);
+    }
+    let mut prev: Option<(i32, i32)> = None;
+    for (x, &mv) in window.iter().take(WIDTH).enumerate() {
+        let (x, y) = (x as i32, row(mv));
+        match prev {
+            // Vertical edges are drawn in full, so a square wave looks square.
+            Some((px, py)) => d.line(px, py, x, y),
+            None => d.set(x, y, true),
+        }
+        prev = Some((x, y));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // menu
 // ---------------------------------------------------------------------------
 
@@ -472,6 +518,10 @@ mod tests {
             s.push(22.0 + (i as f32 / 9.0).sin() * 0.8 + i as f32 * 0.01);
         }
         plot(&mut d, "temp", &s, Scale::Auto { min_span: 2.0 }, 1, " C");
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        let wave: std::vec::Vec<u16> = (0..128).map(|i| if (i + 8) % 40 < 10 { 3300 } else { 0 }).collect();
+        scope(&mut d, "1.00kHz 25% 3.3V 25u", &wave, 3300, Some(1650));
         std::println!("{}", ascii(&d));
         let mut d = Display::new();
         menu(&mut d, "tap: next  hold: ok", &["top", "mandel", "plot temp", "plot A0", "life", "dash", "exit"], 5);

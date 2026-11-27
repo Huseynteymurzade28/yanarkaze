@@ -68,6 +68,10 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     Command { completions: &["off"], ..cmd("autorun", "[cmd|off]", "a command line to run at boot") },
     cmd("save", "", "keep the aliases and the autorun across reboots (in flash)"),
     cmd("forget", "", "erase the saved settings"),
+    Command {
+        completions: &["start", "stop", "show", "csv", "clear"],
+        ..cmd("log", "[start|show|csv]", "temperature log in flash: log start 5m, log show, log csv")
+    },
     cmd("menu", "", "use the board without a computer: OLED menu, tap the button = next, hold = run"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
@@ -98,6 +102,7 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
         completions: &["temp", "env", "rh", "hpa"],
         ..cmd("plot", "<what> [ms]", "live chart on the OLED: temp | env | rh | hpa | <adc pin>")
     },
+    cmd("scope", "<pin> [us]", "oscilloscope on the OLED: frequency, duty, Vpp (scope A0 20 [trig mV])"),
     Command {
         completions: OLED_ACTIONS,
         ..cmd("oled", "<action>", "0.96\" I2C display: text <msg> | temp | dash | life | logo | preview | clear")
@@ -245,7 +250,7 @@ pub(crate) fn chart_level(value: f32, lo: f32, hi: f32, row: usize, rows: usize)
 }
 
 /// Appended to messages about changes that only `save` makes permanent.
-const UNSAVED: &str = " (until reboot; 'save' keeps it)";
+pub(crate) const UNSAVED: &str = " (until reboot; 'save' keeps it)";
 
 const KEYS_HELP: &str = "Keys: Tab = complete, up/down = history, left/right/Home/End = move,\r\n      \
                          Ctrl+W/U/K = delete word/to start/to end, Ctrl+L = clear, Ctrl+C = cancel\r\n";
@@ -267,6 +272,12 @@ pub struct Shell<S: System, R: Read, W: Write> {
     /// key does. `menu_stopped` records that a command was stopped (rather than finishing).
     pub(crate) in_menu: bool,
     pub(crate) menu_stopped: bool,
+    /// The temperature log, once found in flash; when the next record is due; whether one
+    /// has been written since boot; and the room sensor it reads, if there is one.
+    pub(crate) log: Option<crate::log::Log>,
+    pub(crate) log_due: Option<Instant>,
+    pub(crate) log_since_boot: bool,
+    pub(crate) log_room: Option<crate::env::Found>,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -287,6 +298,10 @@ pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Sp
         settings: Settings::default(),
         in_menu: false,
         menu_stopped: false,
+        log: None,
+        log_due: None,
+        log_since_boot: false,
+        log_room: None,
     };
     shell.main_loop().await
 }
@@ -297,35 +312,39 @@ fn uptime_parts() -> (u64, u64, u64, u64) {
 }
 
 impl<S: System, R: Read, W: Write> Shell<S, R, W> {
-    /// Waits `ms` milliseconds. Returns true if a key was pressed in the meantime.
+    /// Waits `ms` milliseconds. Returns true if a key was pressed in the meantime (or, in
+    /// the menu, the button).
     pub(crate) async fn key_or_timeout(&mut self, ms: u64) -> bool {
+        let pressed = self.key_or_timeout_byte(ms).await.is_some();
+        if pressed && self.in_menu {
+            self.menu_stopped = true;
+        }
+        pressed
+    }
+
+    /// Like [`Self::key_or_timeout`], but returns the first byte typed. The button, while the
+    /// menu runs, reads as `0`.
+    pub(crate) async fn key_or_timeout_byte(&mut self, ms: u64) -> Option<u8> {
         let mut buf = [0u8; 8];
         if self.in_menu {
-            let waited = select3(self.rx.read(&mut buf), Timer::after_millis(ms), BUTTON_SIGNAL.wait()).await;
-            return match waited {
-                Either3::First(Ok(n)) if n > 0 => {
-                    self.menu_stopped = true;
-                    true
-                }
+            return match select3(self.rx.read(&mut buf), Timer::after_millis(ms), BUTTON_SIGNAL.wait()).await {
+                Either3::First(Ok(n)) if n > 0 => Some(buf[0]),
                 Either3::First(_) => {
                     Timer::after_millis(ms).await;
-                    false
+                    None
                 }
-                Either3::Second(()) => false,
-                Either3::Third(_) => {
-                    self.menu_stopped = true;
-                    true
-                }
+                Either3::Second(()) => None,
+                Either3::Third(_) => Some(0),
             };
         }
         match select(self.rx.read(&mut buf), Timer::after_millis(ms)).await {
-            Either::First(Ok(n)) if n > 0 => true,
+            Either::First(Ok(n)) if n > 0 => Some(buf[0]),
             Either::First(_) => {
                 // Disconnected or a read error: still honour the delay.
                 Timer::after_millis(ms).await;
-                false
+                None
             }
-            Either::Second(()) => false,
+            Either::Second(()) => None,
         }
     }
 
@@ -352,14 +371,24 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         self.oled_boot().await;
         self.banner().await;
         self.load_settings().await;
+        self.log_resume().await;
         self.term.print(PROMPT).await;
         self.term.flush().await;
 
         let mut buf = [0u8; 32];
         loop {
-            // Wait for whichever comes first: keyboard input or an event from another task.
-            match select(self.rx.read(&mut buf), EVENTS.receive()).await {
-                Either::First(Ok(n)) => {
+            // Wait for whichever comes first: keyboard input, an event from another task, or
+            // the next temperature log record.
+            let due = self.log_due;
+            let log_timer = async move {
+                match due {
+                    Some(t) => Timer::at(t).await,
+                    None => core::future::pending().await,
+                }
+            };
+            match select3(self.rx.read(&mut buf), EVENTS.receive(), log_timer).await {
+                Either3::Third(()) => {}
+                Either3::First(Ok(n)) => {
                     STAT_SHELL.tick();
                     for &b in &buf[..n] {
                         let mut out = Out::new();
@@ -371,8 +400,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                         }
                     }
                 }
-                Either::First(Err(_)) => {}
-                Either::Second(event) => {
+                Either3::First(Err(_)) => {}
+                Either3::Second(event) => {
                     STAT_SHELL.tick();
                     self.print_event(event).await;
                     let mut out = Out::new();
@@ -380,6 +409,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     self.emit(&out).await;
                 }
             }
+            // Also after a long-running command, which kept the timer above from firing.
+            self.log_tick().await;
             self.term.flush().await;
         }
     }
@@ -485,7 +516,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         const TITLE: &str = "tap: next  hold: run";
         type Label = heapless::String<16>;
         type Line = heapless::String<24>;
-        let mut items: heapless::Vec<(Label, Line), 12> = heapless::Vec::new();
+        let mut items: heapless::Vec<(Label, Line), 16> = heapless::Vec::new();
         let mut add = |label: &str, cmd: &str| {
             let _ = items.push((label.try_into().unwrap_or_default(), cmd.try_into().unwrap_or_default()));
         };
@@ -500,10 +531,18 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             let _ = write!(label, "plot {}", name.as_str());
             let _ = write!(cmd, "plot {}", name.as_str());
             add(&label, &cmd);
+            label.clear();
+            cmd.clear();
+            let _ = write!(label, "scope {}", name.as_str());
+            let _ = write!(cmd, "scope {}", name.as_str());
+            add(&label, &cmd);
         }
         if !crate::env::detect(&mut self.sys).await.is_empty() {
             add("room sensor", "env watch");
             add("plot room temp", "plot env");
+        }
+        if self.sys.log_geometry().is_some() {
+            add("log chart", "log show");
         }
         add("life", "oled life");
         add("dashboard", "oled dash");
@@ -521,7 +560,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut selected = 0;
         loop {
             // Show the menu.
-            let labels: heapless::Vec<&str, 12> = items.iter().map(|(l, _)| l.as_str()).collect();
+            let labels: heapless::Vec<&str, 16> = items.iter().map(|(l, _)| l.as_str()).collect();
             out!(self.term, "\r> {}  ({}/{})\x1b[K", labels[selected], selected + 1, labels.len());
             self.term.flush().await;
             if on_oled {
@@ -722,6 +761,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "i2c" => self.cmd_i2c(args).await,
             "env" => self.cmd_env(args).await,
             "plot" => self.cmd_plot(args).await,
+            "log" => self.cmd_log(args).await,
+            "scope" => self.cmd_scope(args).await,
             "alias" => self.cmd_alias(rest).await,
             "unalias" => match args.next() {
                 Some(name) if self.settings.remove_alias(name) => out!(self.term, "removed '{name}'{UNSAVED}\r\n"),

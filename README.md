@@ -98,6 +98,8 @@ System:
   autorun [cmd|off]    a command line to run at boot
   save                 keep the aliases and the autorun across reboots (in flash)
   forget               erase the saved settings
+  log [start|show|csv] temperature log in flash: log start 5m, log show, log csv, log stop,
+                       log clear (NUCLEO: 4096 records, about 68 h at one a minute)
   menu                 use the board without a computer: OLED menu, tap the button = next,
                        hold = run, press again = back (arrows, Enter and q work too)
   hang                 freeze the executor -> watchdog resets the system
@@ -115,6 +117,8 @@ Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
   env [watch]          room temperature, humidity, pressure: BME280/BMP280, SHT3x, AHT20
   plot <what> [ms]     live chart on the OLED: temp | env | rh | hpa | <adc pin>  (plot A0 50)
+  scope <pin> [us]     oscilloscope on the OLED: frequency, duty, Vpp; + / - change the time
+                       base, a third argument sets the trigger level (scope A0 20 1500)
   oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
                        | clear | invert | contrast <0-255> | on | off
 
@@ -162,6 +166,14 @@ With an OLED and `autorun menu; save`, the board works on its own from a USB cha
 menu offers `top`, `mandel`, charts of the chip temperature and the first analog pin, the
 room sensor if one is attached, `life`, the dashboard and the logo. A tap on the button
 stops what is running and brings the menu back.
+
+`log start 1m; save` keeps a temperature record every minute, from the room sensor if there
+is one, and carries on after resets (each one is marked in the log). `log show` charts it
+all, oldest to newest, in the terminal and on the OLED; `log csv` prints it for a
+spreadsheet. When the log is full, the oldest records make room.
+
+For `scope`, wire a PWM output to an analog pin: `pwm D3 25 1000; scope A0 20` shows a
+1 kHz square wave at 25 % duty (in the simulator, PWM output reaches every analog pin).
 
 The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
 are stored on the NUCLEO (last flash page) and in the simulator (`~/.yanarkaze-settings`, or
