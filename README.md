@@ -37,6 +37,8 @@ core/                    yanarkaze-core: no_std, no hardware
   snake.rs               the rules of Snake, reporting only the cells that changed
   game2048.rs            the rules of 2048
   calc.rs                expression evaluator for `calc` (C operators, hex, binary)
+  oled.rs                SSD1306 128x64 framebuffer, 5x7 font, text fitting, Game of Life
+  hw.rs                  hardware commands: gpio, pwm, adc, i2c, oled
   fun.rs                 reaction game, snake, dice, timers, mandelbrot, life, matrix, dump, ferris
   led.rs button.rs       task logic, generic over the traits
   sensor.rs watchdog.rs
@@ -109,6 +111,8 @@ Hardware (Pico 2 and the simulator for now):
   adc <pin> [watch]    read an analog pin in millivolts, e.g. a potentiometer
   knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16
   i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
+  oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
+                       | clear | invert | contrast <0-255> | on | off
 
 Fun:
   reaction             reflex game: hit the button when the LED turns on
@@ -206,7 +210,9 @@ Wiring for the hardware commands (`pins` prints the full list):
 | Potentiometer       | outer legs to 3V3 (pin 36) and AGND (pin 33), middle leg to GP26 (pin 31) |
 | I2C (OLED, sensors) | SDA to GP4 (pin 6), SCL to GP5 (pin 7), VCC to 3V3 (pin 36), GND to GND (pin 38) |
 
-Then try `fade 16`, `adc 26 watch`, `knob 26 16` and `i2c scan`.
+Then try `fade 16`, `adc 26 watch`, `knob 26 16` and `i2c scan`. With a 128x64 SSD1306
+OLED attached the logo appears at boot; try `oled text hello`, `oled dash` and `oled life`
+(`oled preview` draws the framebuffer in the terminal, so it works without a display too).
 
 The RP2350's internal pull-downs suffer from erratum E9 (a pin that has been high holds
 itself at about 2 V); `gpio <pin> read down` works around it by briefly disabling the input

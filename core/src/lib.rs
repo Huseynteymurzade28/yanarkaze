@@ -20,6 +20,7 @@ mod fun;
 mod game2048;
 mod hw;
 mod keys;
+mod oled;
 mod snake;
 mod state;
 

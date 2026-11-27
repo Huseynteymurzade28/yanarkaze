@@ -56,8 +56,10 @@ pub enum HwError {
     OutOfRange,
     /// No I2C device answered at that address.
     Nack,
-    /// The bus did not complete (no pull-ups, short circuit, timeout).
+    /// The bus did not complete (lost arbitration: noise, missing pull-ups, a short).
     Bus,
+    /// The transfer never finished, usually because a device holds SDA or SCL low.
+    Timeout,
 }
 
 impl fmt::Display for HwError {
@@ -69,6 +71,7 @@ impl fmt::Display for HwError {
             HwError::OutOfRange => "value out of range",
             HwError::Nack => "no answer from the device",
             HwError::Bus => "bus error (check wiring and pull-ups)",
+            HwError::Timeout => "bus timed out (a device may be holding a line low; try 'i2c reset')",
         })
     }
 }
@@ -182,6 +185,17 @@ pub trait System {
     /// Where the I2C bus is, e.g. "SDA GP4 (pin 6), SCL GP5 (pin 7)".
     fn i2c_pins(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Changes the I2C clock; returns the frequency set.
+    fn i2c_set_speed(&mut self, _hz: u32) -> Result<u32, HwError> {
+        Err(HwError::Unsupported)
+    }
+
+    /// Frees a stuck bus (clocks SCL until a device lets go of SDA, then sends a STOP) and
+    /// resets the controller. Returns whether (SDA, SCL) are high (free) afterwards.
+    fn i2c_recover(&mut self) -> Result<(bool, bool), HwError> {
+        Err(HwError::Unsupported)
     }
 
     async fn i2c_write(&mut self, _addr: u8, _bytes: &[u8]) -> Result<(), HwError> {

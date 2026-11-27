@@ -354,6 +354,14 @@ impl System for SimSystem {
         Some("simulated bus with an OLED at 0x3c and a BME280 at 0x76")
     }
 
+    fn i2c_set_speed(&mut self, hz: u32) -> Result<u32, HwError> {
+        Ok(hz)
+    }
+
+    fn i2c_recover(&mut self) -> Result<(bool, bool), HwError> {
+        Ok((true, true))
+    }
+
     async fn i2c_write(&mut self, addr: u8, _bytes: &[u8]) -> Result<(), HwError> {
         if SIM_I2C.contains(&addr) { Ok(()) } else { Err(HwError::Nack) }
     }

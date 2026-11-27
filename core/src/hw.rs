@@ -8,8 +8,11 @@ use core::fmt::Write as _;
 use embedded_io_async::{Read, Write};
 use heapless::String;
 
+use crate::oled;
 use crate::platform::{HwError, Pull, System};
 use crate::shell::Shell;
+use crate::state::{BUTTON_PRESSES, HISTORY_SECS, SAMPLE, TEMP_HISTORY, current_led_mode};
+use portable_atomic::Ordering;
 
 /// Accepts `16`, `gp16` and `GP16`.
 pub(crate) fn parse_pin(s: &str) -> Option<u8> {
@@ -261,9 +264,29 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     pub(crate) async fn cmd_i2c<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
-        const USAGE: &str = "i2c scan | read <addr> <reg> [n] | write <addr> <byte>...";
+        const USAGE: &str = "i2c scan | read <addr> <reg> [n] | write <addr> <byte>... | speed <khz> | reset";
         match args.next() {
             Some("scan") => self.i2c_scan().await,
+            Some("reset") => match self.sys.i2c_recover() {
+                Ok((sda, scl)) => {
+                    let level = |high: bool| if high { "high (free)" } else { "LOW" };
+                    out!(self.term, "bus reset: SDA {}, SCL {}\r\n", level(sda), level(scl));
+                    if !(sda && scl) {
+                        self.term.print("a line held low means a short to GND, swapped or loose wires, or a\r\n").await;
+                        self.term
+                            .print("device that is stuck: check the wiring, unplug its power for a moment\r\n")
+                            .await;
+                    }
+                }
+                Err(e) => self.hw_error(e).await,
+            },
+            Some("speed") => match args.next().and_then(|v| v.parse::<u32>().ok()) {
+                Some(khz @ 10..=1000) => match self.sys.i2c_set_speed(khz * 1000) {
+                    Ok(hz) => out!(self.term, "I2C clock {} kHz\r\n", hz / 1000),
+                    Err(e) => self.hw_error(e).await,
+                },
+                _ => self.term.print("usage: i2c speed <10-1000 kHz>, e.g. i2c speed 100\r\n").await,
+            },
             Some("read") => {
                 let (Some(addr), Some(reg)) = (args.next().and_then(parse_addr), args.next().and_then(parse_addr))
                 else {
@@ -338,7 +361,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                         let _ = write!(line, " {addr:02x}");
                         let _ = found.push(addr);
                     }
-                    Err(HwError::Bus) => {
+                    Err(HwError::Bus | HwError::Timeout) => {
                         bus_error = true;
                         let _ = line.push_str(" !!");
                     }
@@ -359,6 +382,266 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         for addr in found {
             let name = i2c_device_name(addr);
             out!(self.term, "  0x{addr:02x}  {}\r\n", if name.is_empty() { "unknown device" } else { name });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OLED (SSD1306, 128x64, I2C address 0x3C)
+    // -----------------------------------------------------------------------
+
+    async fn oled_cmds(&mut self, cmds: &[u8]) -> Result<(), HwError> {
+        let mut buf = [0u8; 32];
+        buf[0] = oled::CMD;
+        buf[1..=cmds.len()].copy_from_slice(cmds);
+        self.sys.i2c_write(oled::ADDRESS, &buf[..=cmds.len()]).await
+    }
+
+    /// Initialises the display the first time it is used.
+    async fn oled_init(&mut self) -> Result<(), HwError> {
+        if !self.oled_ready {
+            self.oled_cmds(&oled::INIT).await?;
+            self.oled_ready = true;
+        }
+        Ok(())
+    }
+
+    /// Sends the whole framebuffer.
+    async fn oled_flush(&mut self) -> Result<(), HwError> {
+        self.oled_init().await?;
+        self.oled_cmds(&oled::WINDOW).await?;
+        let mut buf = [0u8; 1 + oled::WIDTH];
+        buf[0] = oled::DATA;
+        for page in 0..oled::HEIGHT / 8 {
+            buf[1..].copy_from_slice(&self.oled.fb[page * oled::WIDTH..(page + 1) * oled::WIDTH]);
+            self.sys.i2c_write(oled::ADDRESS, &buf).await?;
+        }
+        Ok(())
+    }
+
+    async fn oled_error(&mut self, e: HwError) {
+        self.oled_ready = false; // re-initialise next time, the module may have been replugged
+        match e {
+            HwError::Nack | HwError::Bus | HwError::Timeout => {
+                out!(self.term, "error: no OLED answered at 0x3c ({e})\r\n");
+                if let Some(pins) = self.sys.i2c_pins() {
+                    out!(self.term, "wiring: VCC to 3V3, GND to GND, {pins}\r\n");
+                }
+            }
+            e => self.hw_error(e).await,
+        }
+    }
+
+    fn oled_logo(&mut self) {
+        let board = self.sys.info().board;
+        let d = &mut self.oled;
+        d.clear();
+        d.text_centered(4, "yanarkaze", 2);
+        d.hline(8, 25, oled::WIDTH as i32 - 16);
+        d.text_centered(31, "fire + wind", 1);
+        d.text_centered(43, board, 1);
+        let mut version: String<16> = String::new();
+        let _ = write!(version, "v{}", crate::VERSION);
+        d.text_centered(55, &version, 1);
+    }
+
+    /// Shows the logo at boot if a display is attached; silent otherwise.
+    pub(crate) async fn oled_boot(&mut self) {
+        if self.oled_init().await.is_ok() {
+            self.oled_logo();
+            if self.oled_flush().await.is_err() {
+                self.oled_ready = false;
+            }
+        }
+    }
+
+    pub(crate) async fn cmd_oled(&mut self, rest: &str) {
+        const USAGE: &str =
+            "oled text <msg> | temp | dash | life | logo | preview | clear | invert | contrast <0-255> | on | off";
+        let (typed, arg) = crate::shell::split_word(rest);
+        // Accept unambiguous abbreviations: `oled tex hi` is `oled text hi`.
+        let Some(action) = crate::shell::resolve(typed, crate::shell::OLED_ACTIONS) else {
+            match crate::shell::suggest(typed, crate::shell::OLED_ACTIONS.iter().copied()) {
+                Some(close) if !typed.is_empty() => {
+                    out!(self.term, "unknown oled action '{typed}' - did you mean 'oled {close}'?\r\n")
+                }
+                _ => out!(self.term, "usage: {USAGE}\r\n"),
+            }
+            return;
+        };
+        let result = match action {
+            "text" if !arg.is_empty() => {
+                self.oled.clear();
+                self.oled.text_fit(arg);
+                self.oled_flush().await
+            }
+            "clear" => {
+                self.oled.clear();
+                self.oled_flush().await
+            }
+            "logo" => {
+                self.oled_logo();
+                self.oled_flush().await
+            }
+            "invert" => {
+                self.oled_inverted = !self.oled_inverted;
+                let cmd = if self.oled_inverted { 0xA7 } else { 0xA6 };
+                match self.oled_init().await {
+                    Ok(()) => self.oled_cmds(&[cmd]).await,
+                    Err(e) => Err(e),
+                }
+            }
+            "contrast" => match arg.parse::<u8>() {
+                Ok(level) => match self.oled_init().await {
+                    Ok(()) => self.oled_cmds(&[0x81, level]).await,
+                    Err(e) => Err(e),
+                },
+                Err(_) => {
+                    self.term.print("usage: oled contrast <0-255>\r\n").await;
+                    return;
+                }
+            },
+            "on" | "off" => match self.oled_init().await {
+                Ok(()) => self.oled_cmds(&[if action == "on" { 0xAF } else { 0xAE }]).await,
+                Err(e) => Err(e),
+            },
+            "preview" => {
+                self.oled_preview().await;
+                return;
+            }
+            "temp" => self.oled_temp().await,
+            "dash" => self.oled_dash().await,
+            "life" => self.oled_life().await,
+            _ => {
+                out!(self.term, "usage: {USAGE}\r\n");
+                return;
+            }
+        };
+        if let Err(e) = result {
+            self.oled_error(e).await;
+        }
+    }
+
+    /// Draws the framebuffer in the terminal with braille characters (2x4 pixels each).
+    async fn oled_preview(&mut self) {
+        let mut edge: String<200> = String::new();
+        for _ in 0..oled::WIDTH / 2 {
+            let _ = edge.push('\u{2500}');
+        }
+        out!(self.term, "\u{250c}{}\u{2510}\r\n", edge.as_str());
+        for row in 0..oled::HEIGHT / 4 {
+            let mut line: String<256> = String::new();
+            let _ = line.push('\u{2502}');
+            for col in 0..oled::WIDTH / 2 {
+                let (x, y) = (col * 2, row * 4);
+                const DOTS: [[u32; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+                let mut bits = 0;
+                for (dx, column) in DOTS.iter().enumerate() {
+                    for (dy, bit) in column.iter().enumerate() {
+                        if self.oled.pixel(x + dx, y + dy) {
+                            bits |= bit;
+                        }
+                    }
+                }
+                let _ = line.push(char::from_u32(0x2800 + bits).unwrap_or(' '));
+            }
+            let _ = line.push_str("\u{2502}\r\n");
+            self.term.print(&line).await;
+        }
+        out!(self.term, "\u{2514}{}\u{2518}\r\n", edge.as_str());
+    }
+
+    /// Live temperature: a big number and the last minute as a bar chart.
+    async fn oled_temp(&mut self) -> Result<(), HwError> {
+        self.term.print("showing the temperature on the OLED (any key stops)\r\n").await;
+        loop {
+            let now = SAMPLE.lock(|s| s.get()).reading.temp_c;
+            let data: heapless::Vec<f32, HISTORY_SECS> = TEMP_HISTORY.lock(|h| h.borrow().iter().collect());
+            let d = &mut self.oled;
+            d.clear();
+            let mut big: String<16> = String::new();
+            let _ = write!(big, "{now:.1}{}C", oled::DEGREE);
+            d.text_centered(2, &big, 3);
+            // Chart in the bottom 28 rows, two pixels per second.
+            let (top, height) = (35, 28);
+            d.rect(0, top, oled::WIDTH as i32, height + 1);
+            if !data.is_empty() {
+                let (mut lo, mut hi) = data.iter().fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+                if hi - lo < 1.0 {
+                    let mid = (hi + lo) / 2.0;
+                    (lo, hi) = (mid - 0.5, mid + 0.5);
+                }
+                let x0 = oled::WIDTH as i32 - 2 - data.len() as i32 * 2;
+                for (i, &v) in data.iter().enumerate() {
+                    let h = (((v - lo) / (hi - lo)) * (height - 3) as f32) as i32 + 1;
+                    d.fill_rect(x0 + i as i32 * 2, top + height - h, 2, h, true);
+                }
+            }
+            self.oled_flush().await?;
+            if self.key_or_timeout(1000).await {
+                return Ok(());
+            }
+        }
+    }
+
+    /// A live status page.
+    async fn oled_dash(&mut self) -> Result<(), HwError> {
+        self.term.print("showing a dashboard on the OLED (any key stops)\r\n").await;
+        loop {
+            let ms = embassy_time::Instant::now().as_millis();
+            let (h, m, s) = (ms / 3_600_000, (ms / 60_000) % 60, (ms / 1000) % 60);
+            let temp = SAMPLE.lock(|s| s.get()).reading.temp_c;
+            let led = current_led_mode().name();
+            let presses = BUTTON_PRESSES.load(Ordering::Relaxed);
+            let d = &mut self.oled;
+            d.clear();
+            // Header in inverse video: draw the text, then flip the bar.
+            d.text_centered(1, "yanarkaze", 1);
+            d.invert_rect(0, 0, oled::WIDTH as i32, 10);
+            let mut line: String<32> = String::new();
+            let _ = write!(line, "{h:02}:{m:02}:{s:02}");
+            d.text_centered(14, &line, 2);
+            line.clear();
+            let _ = write!(line, "{temp:.1}{}C", oled::DEGREE);
+            d.text(0, 36, "temp", 1);
+            d.text(40, 36, &line, 1);
+            d.text(0, 46, "led", 1);
+            d.text(40, 46, led, 1);
+            line.clear();
+            let _ = write!(line, "{presses}");
+            d.text(0, 56, "button", 1);
+            d.text(40, 56, &line, 1);
+            self.oled_flush().await?;
+            if self.key_or_timeout(500).await {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Conway's Game of Life on all 8192 pixels; reseeds when it dies out or settles.
+    async fn oled_life(&mut self) -> Result<(), HwError> {
+        self.term.print("Game of Life on the OLED (any key stops)\r\n").await;
+        let mut same = 0;
+        let mut last = u32::MAX;
+        loop {
+            let count = self.oled.count();
+            if count == 0 || same > 40 {
+                for i in 0..self.oled.fb.len() {
+                    // Two random bytes ANDed: about 25 % of the pixels start alive.
+                    let r = self.sys.random_u32();
+                    self.oled.fb[i] = (r as u8) & (r >> 8) as u8;
+                }
+                same = 0;
+            } else {
+                self.oled.life_step();
+            }
+            let count = self.oled.count();
+            // Oscillators keep the count bouncing between a few values; treat that as settled.
+            same = if count.abs_diff(last) <= 2 { same + 1 } else { 0 };
+            last = count;
+            self.oled_flush().await?;
+            if self.key_or_timeout(20).await {
+                return Ok(());
+            }
         }
     }
 }

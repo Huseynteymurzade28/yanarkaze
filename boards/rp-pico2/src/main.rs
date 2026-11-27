@@ -19,6 +19,7 @@
 use core::fmt::Write as _;
 
 use cortex_m::peripheral::DWT;
+use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_rp::adc::{self, Adc, Channel};
 use embassy_rp::clocks::RoscRng;
@@ -106,6 +107,10 @@ static RESERVED: [(&str, &str); 4] = [
 
 const PWM_HZ: core::ops::RangeInclusive<u32> = 10..=1_000_000;
 const I2C_TIMEOUT: Duration = Duration::from_millis(50);
+const I2C_SDA: usize = 4;
+const I2C_SCL: usize = 5;
+/// The pins' I2C function number (F3) in IO_BANK0.
+const FUNC_I2C: u8 = 3;
 
 /// The ADC is shared: the sensor task reads the temperature, the shell reads the pins.
 struct AdcBank {
@@ -236,6 +241,7 @@ struct PicoSystem {
     pwm_pins: u32,
     adc: &'static SharedAdc,
     i2c: I2c<'static, I2C0, i2c::Async>,
+    i2c_config: i2c::Config,
 }
 
 impl PicoSystem {
@@ -259,12 +265,66 @@ impl PicoSystem {
         }
     }
 
-    fn i2c_error(e: i2c::Error) -> HwError {
-        match e {
-            i2c::Error::Abort(AbortReason::NoAcknowledge) => HwError::Nack,
-            i2c::Error::AddressOutOfRange(_) => HwError::OutOfRange,
-            _ => HwError::Bus,
+    /// Maps the outcome of a timed I2C transfer, and frees the bus if it went wrong: a
+    /// transfer cut short by the timeout can leave a device holding SDA low.
+    fn i2c_result(&mut self, r: Result<Result<(), i2c::Error>, embassy_time::TimeoutError>) -> Result<(), HwError> {
+        let e = match r {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(i2c::Error::Abort(AbortReason::NoAcknowledge))) => return Err(HwError::Nack),
+            Ok(Err(i2c::Error::AddressOutOfRange(_))) => return Err(HwError::OutOfRange),
+            Ok(Err(_)) => return Err(HwError::Bus),
+            Err(_) => HwError::Timeout,
+        };
+        // Only a transfer that never finished can leave a device holding the bus.
+        let _ = self.recover_bus();
+        Err(e)
+    }
+
+    /// The standard I2C bus recovery: with the pins taken over as open-drain outputs, clock
+    /// SCL until the device that holds SDA low has shifted out its byte, then send a STOP.
+    fn recover_bus(&mut self) -> Result<(bool, bool), HwError> {
+        let (sio, io) = (pac::SIO, pac::IO_BANK0);
+        let (sda, scl) = (1u32 << I2C_SDA, 1u32 << I2C_SCL);
+        let half_bit = || cortex_m::asm::delay(750); // ~5 us: a 100 kHz clock
+        let sda_high = || sio.gpio_in(0).read() & sda != 0;
+        let scl_high = || sio.gpio_in(0).read() & scl != 0;
+
+        // Output value 0; "high" is output disabled, so the pull-ups do it (open drain).
+        sio.gpio_out(0).value_clr().write_value(sda | scl);
+        sio.gpio_oe(0).value_clr().write_value(sda | scl);
+        for pin in [I2C_SDA, I2C_SCL] {
+            io.gpio(pin).ctrl().write(|w| w.set_funcsel(pac::io::vals::Gpio0ctrlFuncsel::SIOB_PROC_0 as _));
         }
+        half_bit();
+        for _ in 0..9 {
+            if sda_high() {
+                break;
+            }
+            sio.gpio_oe(0).value_set().write_value(scl);
+            half_bit();
+            sio.gpio_oe(0).value_clr().write_value(scl);
+            half_bit();
+        }
+        // STOP: SDA goes high while SCL is high.
+        sio.gpio_oe(0).value_set().write_value(sda);
+        half_bit();
+        sio.gpio_oe(0).value_clr().write_value(sda);
+        half_bit();
+        let free = (sda_high(), scl_high());
+
+        // The controller watched the lines move without it and now believes the bus is
+        // busy; re-enabling it does not clear that. Reset the whole block, then configure
+        // it again (that also restores the registers that only a reset initialises).
+        let resets = pac::RESETS;
+        resets.reset().modify(|w| w.set_i2c0(true));
+        resets.reset().modify(|w| w.set_i2c0(false));
+        while !resets.reset_done().read().i2c0() {}
+
+        for pin in [I2C_SDA, I2C_SCL] {
+            io.gpio(pin).ctrl().write(|w| w.set_funcsel(FUNC_I2C));
+        }
+        self.i2c.set_config(&self.i2c_config).map_err(|_| HwError::Bus)?;
+        Ok(free)
     }
 }
 
@@ -390,19 +450,31 @@ impl System for PicoSystem {
         Some("SDA GP4 = pin 6, SCL GP5 = pin 7")
     }
 
+    fn i2c_set_speed(&mut self, hz: u32) -> Result<u32, HwError> {
+        let mut config = self.i2c_config;
+        config.frequency = hz;
+        self.i2c.set_config(&config).map_err(|_| HwError::OutOfRange)?;
+        self.i2c_config = config;
+        Ok(hz)
+    }
+
+    fn i2c_recover(&mut self) -> Result<(bool, bool), HwError> {
+        self.recover_bus()
+    }
+
     async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {
-        let op = self.i2c.write_async(addr, bytes.iter().copied());
-        with_timeout(I2C_TIMEOUT, op).await.map_err(|_| HwError::Bus)?.map_err(Self::i2c_error)
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.write_async(addr, bytes.iter().copied())).await;
+        self.i2c_result(r)
     }
 
     async fn i2c_read(&mut self, addr: u8, buf: &mut [u8]) -> Result<(), HwError> {
-        let op = self.i2c.read_async(addr, buf);
-        with_timeout(I2C_TIMEOUT, op).await.map_err(|_| HwError::Bus)?.map_err(Self::i2c_error)
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.read_async(addr, buf)).await;
+        self.i2c_result(r)
     }
 
     async fn i2c_write_read(&mut self, addr: u8, bytes: &[u8], buf: &mut [u8]) -> Result<(), HwError> {
-        let op = self.i2c.write_read_async(addr, bytes.iter().copied(), buf);
-        with_timeout(I2C_TIMEOUT, op).await.map_err(|_| HwError::Bus)?.map_err(Self::i2c_error)
+        let r = with_timeout(I2C_TIMEOUT, self.i2c.write_read_async(addr, bytes.iter().copied(), buf)).await;
+        self.i2c_result(r)
     }
 }
 
@@ -520,7 +592,7 @@ async fn main(spawner: Spawner) {
         22 => PIN_22,
     );
 
-    let sys = PicoSystem { rng: RoscRng, reset_reason, uid, gpios, pwm_pins: 0, adc, i2c };
+    let sys = PicoSystem { rng: RoscRng, reset_reason, uid, gpios, pwm_pins: 0, adc, i2c, i2c_config };
     let rx = UsbRx { rx: receiver, buf: [0; 64], pos: 0, len: 0 };
     let led = PicoLed(Output::new(p.PIN_25, Level::Low));
     let sensor = DieSensor { adc };

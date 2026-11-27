@@ -10,6 +10,7 @@ use heapless::String;
 use portable_atomic::Ordering;
 
 use crate::editor::{Editor, Out};
+use crate::oled::Display;
 use crate::platform::System;
 use crate::state::{
     ALERT_MILLI_C, BUTTON_PRESSES, EVENTS, Event, HISTORY_SECS, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS,
@@ -71,6 +72,8 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
 ];
 
 const GPIO_ACTIONS: &[&str] = &["on", "off", "toggle", "read"];
+pub(crate) const OLED_ACTIONS: &[&str] =
+    &["text", "temp", "dash", "life", "logo", "preview", "clear", "invert", "contrast", "on", "off"];
 
 pub(crate) const HW_COMMANDS: &[Command] = &[
     cmd("pins", "", "which pins can do what on this board"),
@@ -80,8 +83,12 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
     cmd("adc", "<pin> [watch]", "read an analog pin in millivolts, e.g. a potentiometer"),
     cmd("knob", "<adc> <pwm>", "a potentiometer dims an LED, live: knob 26 16"),
     Command {
-        completions: &["scan", "read", "write"],
+        completions: &["scan", "read", "write", "speed", "reset"],
         ..cmd("i2c", "scan|read|write", "find I2C devices, read or write registers")
+    },
+    Command {
+        completions: OLED_ACTIONS,
+        ..cmd("oled", "<action>", "0.96\" I2C display: text <msg> | temp | dash | life | logo | preview | clear")
     },
 ];
 
@@ -158,6 +165,57 @@ pub(crate) fn complete(context: &str) -> &'static [&'static str] {
     }
 }
 
+/// Edit distance between two short words: insertions, deletions, substitutions and
+/// swapped neighbours ("tmep" is one step from "temp"), the most common typo.
+fn distance(a: &str, b: &str) -> usize {
+    const MAX: usize = 24;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() > MAX || b.len() > MAX {
+        return usize::MAX;
+    }
+    let mut d = [[0usize; MAX + 1]; MAX + 1];
+    for (i, row) in d.iter_mut().enumerate().take(a.len() + 1) {
+        row[0] = i;
+    }
+    for j in 0..=b.len() {
+        d[0][j] = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// The closest of `choices` to a mistyped `word`, if it is close enough to be a typo.
+pub(crate) fn suggest<'a>(word: &str, choices: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = if word.len() <= 3 { 1 } else { 2 };
+    choices
+        .into_iter()
+        .map(|c| (distance(word, c), c))
+        .filter(|&(d, _)| d <= limit)
+        .min_by_key(|&(d, _)| d)
+        .map(|(_, c)| c)
+}
+
+/// Resolves `word` against `choices`: an exact match, or an unambiguous prefix (`tex` -> `text`).
+pub(crate) fn resolve<'a>(word: &str, choices: &[&'a str]) -> Option<&'a str> {
+    if let Some(&exact) = choices.iter().find(|&&c| c == word) {
+        return Some(exact);
+    }
+    let mut matches = choices.iter().filter(|c| !word.is_empty() && c.starts_with(word));
+    match (matches.next(), matches.next()) {
+        (Some(&only), None) => Some(only),
+        _ => None,
+    }
+}
+
 /// Splits off the first word: `"led  on x"` -> `("led", "on x")`.
 pub(crate) fn split_word(s: &str) -> (&str, &str) {
     let s = s.trim_start();
@@ -186,6 +244,9 @@ pub struct Shell<S: System, R: Read, W: Write> {
     editor: Editor,
     /// Last level written to each pin by `gpio`, for `gpio <pin> toggle`.
     pub(crate) gpio_levels: u64,
+    pub(crate) oled: Display,
+    pub(crate) oled_ready: bool,
+    pub(crate) oled_inverted: bool,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -193,8 +254,17 @@ pub struct Shell<S: System, R: Read, W: Write> {
 /// `rx` must be cancel-safe: dropping a pending `read` must not lose bytes (ring buffers,
 /// pipes and buffered UARTs are fine).
 pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Spawner) -> ! {
-    let mut shell =
-        Shell { sys, rx, term: Term::new(tx), spawner, editor: Editor::new(PROMPT, complete), gpio_levels: 0 };
+    let mut shell = Shell {
+        sys,
+        rx,
+        term: Term::new(tx),
+        spawner,
+        editor: Editor::new(PROMPT, complete),
+        gpio_levels: 0,
+        oled: Display::new(),
+        oled_ready: false,
+        oled_inverted: false,
+    };
     shell.main_loop().await
 }
 
@@ -238,6 +308,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     async fn main_loop(&mut self) -> ! {
+        self.oled_boot().await;
         self.banner().await;
         self.term.print(PROMPT).await;
         self.term.flush().await;
@@ -370,6 +441,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "adc" => self.cmd_adc(args).await,
             "knob" => self.cmd_knob(args).await,
             "i2c" => self.cmd_i2c(args).await,
+            "oled" => self.cmd_oled(rest).await,
             "calc" => self.cmd_calc(rest).await,
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.
             "repeat" | "every" => self.term.print("repeat and every cannot be nested\r\n").await,
@@ -418,7 +490,10 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "dump" => self.cmd_dump(args).await,
             "say" => fun::say(&mut self.term, args).await,
             "fortune" => self.cmd_fortune().await,
-            other => out!(self.term, "unknown command: '{other}' (try 'help')\r\n"),
+            other => match suggest(other, COMMAND_NAMES) {
+                Some(close) => out!(self.term, "unknown command: '{other}' - did you mean '{close}'?\r\n"),
+                None => out!(self.term, "unknown command: '{other}' (try 'help')\r\n"),
+            },
         }
     }
 
@@ -737,6 +812,21 @@ mod tests {
         for c in all_commands() {
             assert!(c.name.len() + 1 + c.args.len() <= 20, "usage of '{}' is too long", c.name);
         }
+    }
+
+    #[test]
+    fn typos_and_prefixes() {
+        assert_eq!(distance("tex", "text"), 1);
+        assert_eq!(distance("tmep", "temp"), 1);
+        assert_eq!(distance("tmep", "top"), 2);
+        assert_eq!(suggest("tmep", COMMAND_NAMES), Some("temp"));
+        assert_eq!(suggest("hlep", COMMAND_NAMES), Some("help"));
+        assert_eq!(suggest("xyzzy", COMMAND_NAMES), None);
+        assert_eq!(resolve("tex", OLED_ACTIONS), Some("text"));
+        assert_eq!(resolve("text", OLED_ACTIONS), Some("text"));
+        assert_eq!(resolve("te", OLED_ACTIONS), None); // text or temp
+        assert_eq!(resolve("on", OLED_ACTIONS), Some("on")); // exact beats the prefix of nothing else
+        assert_eq!(resolve("o", OLED_ACTIONS), None); // on or off
     }
 
     #[test]
