@@ -171,16 +171,29 @@ impl Led for NucleoLed {
     }
 }
 
-/// The blue button is active low; the CPU sleeps until the EXTI interrupt fires.
-struct UserButton(ExtiInput<'static, Async>);
+/// The blue USER button on PC13; the CPU sleeps until the EXTI interrupt fires. It is active
+/// low on the NUCLEO-L452RE (a pull-up, pressing shorts to GND) but active high on the -P
+/// (a pull-down, pressing connects 3V3), so `active_high` is read from the idle level at boot.
+struct UserButton {
+    pin: ExtiInput<'static, Async>,
+    active_high: bool,
+}
 
 impl Button for UserButton {
     async fn wait_for_press(&mut self) {
-        self.0.wait_for_falling_edge().await;
+        if self.active_high {
+            self.pin.wait_for_rising_edge().await
+        } else {
+            self.pin.wait_for_falling_edge().await
+        }
     }
 
     async fn wait_for_release(&mut self) {
-        self.0.wait_for_high().await;
+        if self.active_high {
+            self.pin.wait_for_low().await
+        } else {
+            self.pin.wait_for_high().await
+        }
     }
 }
 
@@ -646,7 +659,9 @@ async fn main(spawner: Spawner) {
 
     let led =
         NucleoLed { a: Output::new(p.PA5, Level::Low, Speed::Low), b: Output::new(p.PB13, Level::Low, Speed::Low) };
-    let button = UserButton(ExtiInput::new(p.PC13, p.EXTI13, Pull::None, Irqs));
+    let pin = ExtiInput::new(p.PC13, p.EXTI13, Pull::None, Irqs);
+    // Nobody holds the button during boot, so it reads its idle level: low means the -P.
+    let button = UserButton { active_high: pin.is_low(), pin };
     let wdg = Iwdg(IndependentWatchdog::new(p.IWDG, 2_000_000)); // 2 s timeout
     // I2C1 on the Arduino header's SCL/SDA (D15/D14). The internal pull-ups are weak
     // (about 40k); most OLED modules bring their own, which is what makes 400 kHz work.

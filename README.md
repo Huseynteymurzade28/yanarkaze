@@ -6,12 +6,9 @@
 
 <p align="center"><em>A tiny async OS in Rust that keeps burning wherever the wind takes it.</em></p>
 
-**yanar** (Azerbaijani: *burning*, as in [Yanardag](https://en.wikipedia.org/wiki/Yanar_Dag), the
-mountain that has been on fire for millennia) + **kaze** (Japanese 風: *wind*).
-
 A tiny async operating system written in Rust on top of the [Embassy](https://embassy.dev)
-executor. It keeps burning on whatever board the wind carries it to: the same shell, tasks and
-commands run on an STM32, an RP2040, an nRF52840, an ESP32-C3, and even in your desktop terminal.
+executor. The same shell, tasks and commands run on an STM32, an RP2040, an nRF52840, an
+ESP32-C3, and even in your desktop terminal.
 
 ## Platforms
 

@@ -29,9 +29,6 @@ const LOGO: &[&str] = &[
     "  \x1b[1;38;5;196m \\_, |\x1b[1;38;5;202m\\__,_|\x1b[1;38;5;208m|_||_|\x1b[1;38;5;214m\\__,_|\x1b[1;38;5;220m|_|  \x1b[1;38;5;159m|_\\_\\\x1b[1;38;5;123m\\__,_|\x1b[1;38;5;87m/__| \x1b[1;38;5;51m\\___|\x1b[0m",
     "  \x1b[1;38;5;196m |__/ \x1b[1;38;5;202m      \x1b[1;38;5;208m      \x1b[1;38;5;214m      \x1b[1;38;5;220m     \x1b[1;38;5;159m     \x1b[1;38;5;123m      \x1b[1;38;5;87m     \x1b[1;38;5;51m     \x1b[0m",
     "",
-    "  \x1b[38;5;208myanar\x1b[0m (fire, as in Yanardag) + \x1b[38;5;51mkaze\x1b[0m (\u{98a8}, wind)",
-    "  an async OS that keeps burning wherever the wind takes it",
-    "",
 ];
 
 /// One shell command: its name, how to call it and what it does. `help` and tab completion

@@ -1,8 +1,6 @@
 //! # yanarkaze-core
 //!
-//! *yanar* (Azerbaijani: "burning", as in Yanardag, the mountain that never stops burning)
-//! + *kaze* (Japanese 風: "wind"). A tiny async operating system that keeps burning on
-//! whatever board the wind carries it to.
+//! A tiny async operating system on top of the Embassy executor.
 //!
 //! This crate contains everything that does not depend on hardware: the shell, the
 //! commands, the LED patterns, the button / sensor / watchdog task logic and the shared
