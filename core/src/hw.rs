@@ -406,6 +406,15 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     /// Sends the whole framebuffer.
+    /// Sends the framebuffer while `*on`; a failed transfer turns `*on` off, so a game that
+    /// mirrors itself on the OLED carries on in the terminal if the display goes away.
+    pub(crate) async fn oled_mirror(&mut self, on: &mut bool) {
+        if *on && self.oled_flush().await.is_err() {
+            self.oled_ready = false;
+            *on = false;
+        }
+    }
+
     pub(crate) async fn oled_flush(&mut self) -> Result<(), HwError> {
         self.oled_init().await?;
         self.oled_cmds(&oled::WINDOW).await?;

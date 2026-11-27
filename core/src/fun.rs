@@ -442,16 +442,18 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         out!(self.term, "\x1b[1;1H\x1b[1;32mSNAKE\x1b[0m  score {score:<4} best {best:<4} {note}\x1b[K");
     }
 
-    /// Mirrors the game on the OLED, if one answered at boot. A failed transfer turns the
-    /// mirror off for the rest of the game, so a loose wire never stops the game itself.
+    /// Mirrors the game on the OLED, if one answered at boot.
     async fn snake_oled(&mut self, game: &Game, banner: Option<&str>, on: &mut bool) {
-        if !*on {
-            return;
+        if *on {
+            snake::render(game, BEST_SNAKE.load(Ordering::Relaxed), banner, &mut self.oled);
+            self.oled_mirror(on).await;
         }
-        snake::render(game, BEST_SNAKE.load(Ordering::Relaxed), banner, &mut self.oled);
-        if self.oled_flush().await.is_err() {
-            self.oled_ready = false;
-            *on = false;
+    }
+
+    async fn oled_2048(&mut self, board: &Board, banner: Option<&str>, on: &mut bool) {
+        if *on {
+            game2048::render(board, BEST_2048.load(Ordering::Relaxed), banner, &mut self.oled);
+            self.oled_mirror(on).await;
         }
     }
 
@@ -631,6 +633,8 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let mut reached_2048 = false;
         self.term.print("\x1b[2J\x1b[?25l").await;
         self.draw_2048(&board, KEYS).await;
+        let mut on_oled = self.oled_ready;
+        self.oled_2048(&board, None, &mut on_oled).await;
 
         let mut buf = [0u8; 16];
         let outcome = 'game: loop {
@@ -647,7 +651,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     Some(Key::Down | Key::Char(b's' | b'S' | b'j')) => Move::Down,
                     Some(Key::Left | Key::Char(b'a' | b'A' | b'h')) => Move::Left,
                     Some(Key::Right | Key::Char(b'd' | b'D' | b'l')) => Move::Right,
-                    Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game "quit",
+                    Some(Key::Char(b'q' | b'Q') | Key::Interrupt) => break 'game ("quit", None),
                     _ => continue,
                 };
                 if !board.play(m, || self.sys.random_u32()) {
@@ -661,11 +665,14 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                 };
                 self.draw_2048(&board, note).await;
                 if board.is_stuck() {
-                    break 'game "\x1b[1;31mno moves left\x1b[0m";
+                    break 'game ("\x1b[1;31mno moves left\x1b[0m", Some("NO MOVES"));
                 }
+                self.oled_2048(&board, None, &mut on_oled).await;
             }
         };
 
+        let (outcome, banner) = outcome;
+        self.oled_2048(&board, banner, &mut on_oled).await;
         let best = BEST_2048.fetch_max(board.score, Ordering::Relaxed).max(board.score);
         let record = if board.score > 0 && board.score == best { "  \x1b[1;33mnew best!\x1b[0m" } else { "" };
         out!(

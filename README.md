@@ -213,6 +213,7 @@ Wiring for the hardware commands (`pins` prints the full list):
 Then try `fade 16`, `adc 26 watch`, `knob 26 16` and `i2c scan`. With a 128x64 SSD1306
 OLED attached the logo appears at boot; try `oled text hello`, `oled dash` and `oled life`
 (`oled preview` draws the framebuffer in the terminal, so it works without a display too).
+`snake` and `2048` play on the OLED as well, alongside the terminal.
 
 The RP2350's internal pull-downs suffer from erratum E9 (a pin that has been high holds
 itself at about 2 V); `gpio <pin> read down` works around it by briefly disabling the input
