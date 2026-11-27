@@ -116,6 +116,7 @@ pub(crate) const FILE_COMMANDS: &[Command] = &[
     cmd("rm", "<file>...", "delete files"),
     cmd("mv", "<file> <name>", "rename a file"),
     cmd("df", "", "how much room the files take"),
+    cmd("edit", "<file>", "full-screen editor: arrows move, ^S saves, ^X quits"),
 ];
 
 pub(crate) const FUN_COMMANDS: &[Command] = &[
@@ -789,6 +790,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "rm" => self.cmd_rm(args).await,
             "mv" => self.cmd_mv(args).await,
             "df" => self.cmd_df().await,
+            "edit" => self.cmd_edit(args).await,
             "sleep" => self.cmd_sleep().await,
             "log" => self.cmd_log(args).await,
             "scope" => self.cmd_scope(args).await,

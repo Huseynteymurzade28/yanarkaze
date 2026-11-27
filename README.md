@@ -129,6 +129,7 @@ Files (ember, in flash: NUCLEO and the simulator):
   rm <file>...         delete files
   mv <file> <name>     rename a file
   df                   how much room the files take
+  edit <file>          full-screen editor: arrows, Home/End, PgUp/PgDn; ^S saves, ^X quits
 
 Fun:
   reaction             reflex game: hit the button when the LED turns on

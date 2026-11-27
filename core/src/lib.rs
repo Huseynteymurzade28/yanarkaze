@@ -29,6 +29,7 @@ mod screens;
 pub mod settings;
 mod snake;
 mod state;
+mod textedit;
 
 pub mod button;
 pub mod led;
