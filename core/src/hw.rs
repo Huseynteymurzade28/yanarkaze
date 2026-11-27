@@ -674,13 +674,12 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         let board = self.sys.info().board;
         let d = &mut self.oled;
         d.clear();
-        d.text_centered(4, "yanarkaze", 2);
-        d.hline(8, 25, oled::WIDTH as i32 - 16);
-        d.text_centered(31, "fire + wind", 1);
-        d.text_centered(43, board, 1);
+        d.text_centered(8, "yanarkaze", 2);
+        d.hline(8, 28, oled::WIDTH as i32 - 16);
+        d.text_centered(37, board, 1);
         let mut version: String<16> = String::new();
         let _ = write!(version, "v{}", crate::VERSION);
-        d.text_centered(55, &version, 1);
+        d.text_centered(50, &version, 1);
     }
 
     /// Shows the logo at boot if a display is attached; silent otherwise.
