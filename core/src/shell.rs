@@ -118,6 +118,7 @@ pub(crate) const FILE_COMMANDS: &[Command] = &[
     cmd("df", "", "how much room the files take"),
     cmd("edit", "<file>", "full-screen editor: arrows move, ^S saves, ^X quits"),
     cmd("format", "yes", "erase every file and start ember afresh"),
+    cmd("yeloka", "<file>", "run a program in yeloka: let, print, if/else, while (early days)"),
     cmd("run", "<file> [args]", "run a script: a command per line, # comments, $1..$9 (or just: boot)"),
 ];
 
@@ -872,6 +873,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "df" => self.cmd_df().await,
             "edit" => self.cmd_edit(args).await,
             "format" => self.cmd_format(args.next()).await,
+            "yeloka" => self.cmd_yeloka(args.next()).await,
             "sleep" => self.cmd_sleep().await,
             "log" => self.cmd_log(args).await,
             "scope" => self.cmd_scope(args).await,

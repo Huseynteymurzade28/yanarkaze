@@ -150,6 +150,37 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
+    /// Runs a yeloka program from a file.
+    pub(crate) async fn cmd_yeloka(&mut self, name: Option<&str>) {
+        let Some(name) = name else {
+            self.term.print("usage: yeloka <file>   (a small language: let, print, if, while)\r\n").await;
+            return;
+        };
+        let read = match ember(&mut self.sys) {
+            Ok(mut fs) => fs.read(name, &mut self.bufs.file).await,
+            Err(e) => Err(e),
+        };
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                out!(self.term, "{name}: {e}\r\n");
+                return;
+            }
+        };
+        let Ok(src) = core::str::from_utf8(&self.bufs.file[..n]) else {
+            out!(self.term, "{name}: not text\r\n");
+            return;
+        };
+        let (output, result) = crate::yeloka::run(src);
+        for line in output.split_inclusive('\n') {
+            self.term.print(line.strip_suffix('\n').unwrap_or(line)).await;
+            self.term.print("\r\n").await;
+        }
+        if let Err(e) = result {
+            out!(self.term, "{name}: {e}\r\n");
+        }
+    }
+
     pub(crate) async fn cmd_df(&mut self) {
         let result = match ember(&mut self.sys) {
             Ok(mut fs) => fs.list().await.map(|files| (files, fs.capacity())),

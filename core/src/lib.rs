@@ -32,6 +32,7 @@ pub mod settings;
 mod snake;
 mod state;
 mod textedit;
+mod yeloka;
 
 pub mod button;
 pub mod led;

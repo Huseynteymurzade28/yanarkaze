@@ -132,6 +132,7 @@ Files (ember, in flash: NUCLEO and the simulator):
   df                   how much room the files take
   format yes           erase every file and start ember afresh
   run <file> [args]    run a script (or just type its name: boot runs boot.ynk)
+  yeloka <file>        run a program in yeloka, the built-in language (early days)
   edit <file>          full-screen editor: arrows, Home/End, PgUp/PgDn; ^S saves, ^X quits
 
 Fun:
@@ -210,6 +211,18 @@ yanarkaze> edit greet.ynk              # echo hello $1; temp
 yanarkaze> greet Ayse                  -> hello Ayse, then the temperature
 yanarkaze> autorun greet world; save   -> runs at every boot
 yanarkaze> run greet Ayse > out.txt    -> what it printed, in a file
+```
+
+yeloka is a small language for scripts that need logic, just begun: integers, variables,
+`+ - * / %`, comparisons, `and` / `or` / `not`, `print`, `if` / `else if` / `else` and
+`while`, `#` comments:
+
+```
+let n = 1
+while n <= 5 {
+    if n % 2 == 0 { print n, "even" } else { print n, "odd" }
+    n = n + 1
+}
 ```
 
 The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
