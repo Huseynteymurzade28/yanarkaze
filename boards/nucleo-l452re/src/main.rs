@@ -40,8 +40,8 @@ use embassy_time::{Duration, Timer};
 use heapless::String;
 use static_cell::StaticCell;
 use yanarkaze_core::{
-    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull as CorePull, Reading, Sensor, Slept, System,
-    Wake, Watchdog,
+    Area, BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull as CorePull, Reading, Sensor, Slept,
+    System, Wake, Watchdog,
 };
 use {defmt_rtt as _, panic_probe as _};
 
@@ -86,6 +86,9 @@ const SETTINGS_OFFSET: u32 = FLASH_SIZE as u32 - SETTINGS_PAGE;
 /// The temperature log: the 16 pages (32 KB, 4096 records) below the settings.
 const LOG_PAGES: u32 = 16;
 const LOG_OFFSET: u32 = SETTINGS_OFFSET - LOG_PAGES * SETTINGS_PAGE;
+/// The file system: the 48 pages (96 KB) below the log.
+const FILES_PAGES: u32 = 48;
+const FILES_OFFSET: u32 = LOG_OFFSET - FILES_PAGES * SETTINGS_PAGE;
 
 /// Where the firmware image ends in flash: the initial values of `.data` are its last part.
 fn image_end() -> u32 {
@@ -638,23 +641,24 @@ impl System for NucleoSystem {
         Some((8_000, 1))
     }
 
-    fn log_geometry(&self) -> Option<(usize, usize)> {
+    fn flash_area(&self, area: Area) -> Option<(usize, usize)> {
+        let (start, pages) = Self::area_span(area);
         // Only if the program stays clear of it, should the firmware ever grow that far.
-        (image_end() <= FLASH_BASE as u32 + LOG_OFFSET).then_some((LOG_PAGES as usize, SETTINGS_PAGE as usize))
+        (image_end() <= FLASH_BASE as u32 + start).then_some((pages as usize, SETTINGS_PAGE as usize))
     }
 
-    fn log_read(&mut self, offset: usize, buf: &mut [u8; 8]) -> Result<(), HwError> {
-        let offset = Self::log_offset(offset, 8)?;
+    fn area_read(&mut self, area: Area, offset: usize, buf: &mut [u8]) -> Result<(), HwError> {
+        let offset = Self::area_offset(area, offset, buf.len())?;
         self.flash.blocking_read(offset, buf).map_err(|_| HwError::Bus)
     }
 
-    fn log_write(&mut self, offset: usize, record: &[u8; 8]) -> Result<(), HwError> {
-        let offset = Self::log_offset(offset, WRITE_SIZE)?;
-        self.flash.blocking_write(offset, record).map_err(|_| HwError::Bus)
+    fn area_write(&mut self, area: Area, offset: usize, data: &[u8]) -> Result<(), HwError> {
+        let offset = Self::area_offset(area, offset, data.len())?;
+        self.flash.blocking_write(offset, data).map_err(|_| HwError::Bus)
     }
 
-    fn log_erase(&mut self, page: usize) -> Result<(), HwError> {
-        let start = Self::log_offset(page * SETTINGS_PAGE as usize, SETTINGS_PAGE as usize)?;
+    fn area_erase(&mut self, area: Area, page: usize) -> Result<(), HwError> {
+        let start = Self::area_offset(area, page * SETTINGS_PAGE as usize, SETTINGS_PAGE as usize)?;
         self.flash.blocking_erase(start, start + SETTINGS_PAGE).map_err(|_| HwError::Bus)
     }
 
@@ -717,14 +721,22 @@ impl System for NucleoSystem {
 }
 
 impl NucleoSystem {
-    /// Checks that `len` bytes at `offset` in the log area stay inside it; returns the offset
-    /// from the start of flash.
-    fn log_offset(offset: usize, len: usize) -> Result<u32, HwError> {
-        let size = (LOG_PAGES * SETTINGS_PAGE) as usize;
-        if image_end() > FLASH_BASE as u32 + LOG_OFFSET || offset + len > size {
+    /// Where `area` starts (from the start of flash) and how many pages it has.
+    fn area_span(area: Area) -> (u32, u32) {
+        match area {
+            Area::Log => (LOG_OFFSET, LOG_PAGES),
+            Area::Files => (FILES_OFFSET, FILES_PAGES),
+        }
+    }
+
+    /// Checks that `len` bytes at `offset` stay inside `area`, and that the program does not
+    /// reach into it; returns the offset from the start of flash.
+    fn area_offset(area: Area, offset: usize, len: usize) -> Result<u32, HwError> {
+        let (start, pages) = Self::area_span(area);
+        if image_end() > FLASH_BASE as u32 + start || offset + len > (pages * SETTINGS_PAGE) as usize {
             return Err(HwError::OutOfRange);
         }
-        Ok(LOG_OFFSET + offset as u32)
+        Ok(start + offset as u32)
     }
 }
 

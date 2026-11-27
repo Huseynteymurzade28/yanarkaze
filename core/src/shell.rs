@@ -110,6 +110,14 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
     },
 ];
 
+pub(crate) const FILE_COMMANDS: &[Command] = &[
+    cmd("ls", "", "list the files (ember, in flash)"),
+    cmd("cat", "<file>...", "print files"),
+    cmd("rm", "<file>...", "delete files"),
+    cmd("mv", "<file> <name>", "rename a file"),
+    cmd("df", "", "how much room the files take"),
+];
+
 pub(crate) const FUN_COMMANDS: &[Command] = &[
     cmd("reaction", "", "reflex game: hit the button when the LED turns on"),
     Command {
@@ -129,10 +137,10 @@ pub(crate) const FUN_COMMANDS: &[Command] = &[
 
 /// Names of every command, in help order (for tab completion of the first word).
 /// Every command table, in help order.
-const SECTIONS: [(&str, &[Command]); 3] =
-    [("System:", SYSTEM_COMMANDS), ("Hardware:", HW_COMMANDS), ("Fun:", FUN_COMMANDS)];
+const SECTIONS: [(&str, &[Command]); 4] =
+    [("System:", SYSTEM_COMMANDS), ("Files:", FILE_COMMANDS), ("Hardware:", HW_COMMANDS), ("Fun:", FUN_COMMANDS)];
 
-const COMMAND_COUNT: usize = SYSTEM_COMMANDS.len() + HW_COMMANDS.len() + FUN_COMMANDS.len();
+const COMMAND_COUNT: usize = SYSTEM_COMMANDS.len() + FILE_COMMANDS.len() + HW_COMMANDS.len() + FUN_COMMANDS.len();
 
 /// Names of every command, in help order (for tab completion of the first word).
 const COMMAND_NAMES: [&str; COMMAND_COUNT] = {
@@ -483,34 +491,42 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             }
         };
         for part in line.split(';').map(str::trim).filter(|p| !p.is_empty()) {
-            let (first, rest) = split_word(part);
-            let (count, inner) = split_word(rest);
-            match first {
-                "repeat" => match count.parse::<u32>() {
-                    Ok(n @ 1..=1000) if Self::wrappable(inner) => {
-                        for i in 0..n {
-                            self.run_single(inner).await;
-                            if i + 1 < n && self.key_or_timeout(1).await {
-                                out!(self.term, "stopped after {} of {n}\r\n", i + 1);
-                                break;
-                            }
-                        }
-                    }
-                    _ => self.term.print("usage: repeat <1..1000> <command>\r\n").await,
-                },
-                "every" => match count.parse::<f32>() {
-                    Ok(s) if (0.1..=3600.0).contains(&s) && Self::wrappable(inner) => loop {
+            match crate::files::split_redirect(part) {
+                (cmd, Some((file, append))) => self.run_redirected(cmd, file, append).await,
+                (cmd, None) => self.run_part(cmd).await,
+            }
+        }
+    }
+
+    /// One `;`-separated part of a command line: a command, or `repeat` / `every` around one.
+    pub(crate) async fn run_part(&mut self, part: &str) {
+        let (first, rest) = split_word(part);
+        let (count, inner) = split_word(rest);
+        match first {
+            "repeat" => match count.parse::<u32>() {
+                Ok(n @ 1..=1000) if Self::wrappable(inner) => {
+                    for i in 0..n {
                         self.run_single(inner).await;
-                        self.term.flush().await;
-                        if self.key_or_timeout((s * 1000.0) as u64).await {
+                        if i + 1 < n && self.key_or_timeout(1).await {
+                            out!(self.term, "stopped after {} of {n}\r\n", i + 1);
                             break;
                         }
-                    },
-                    _ => self.term.print("usage: every <0.1..3600 seconds> <command>\r\n").await,
+                    }
+                }
+                _ => self.term.print("usage: repeat <1..1000> <command>\r\n").await,
+            },
+            "every" => match count.parse::<f32>() {
+                Ok(s) if (0.1..=3600.0).contains(&s) && Self::wrappable(inner) => loop {
+                    self.run_single(inner).await;
+                    self.term.flush().await;
+                    if self.key_or_timeout((s * 1000.0) as u64).await {
+                        break;
+                    }
                 },
-                "menu" => self.cmd_menu().await,
-                _ => self.run_single(part).await,
-            }
+                _ => self.term.print("usage: every <0.1..3600 seconds> <command>\r\n").await,
+            },
+            "menu" => self.cmd_menu().await,
+            _ => self.run_single(part).await,
         }
     }
 
@@ -547,7 +563,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             add("room sensor", "env watch");
             add("plot room temp", "plot env");
         }
-        if self.sys.log_geometry().is_some() {
+        if self.sys.flash_area(crate::platform::Area::Log).is_some() {
             add("log chart", "log show");
         }
         add("life", "oled life");
@@ -768,6 +784,11 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "i2c" => self.cmd_i2c(args).await,
             "env" => self.cmd_env(args).await,
             "plot" => self.cmd_plot(args).await,
+            "ls" => self.cmd_ls().await,
+            "cat" => self.cmd_cat(args).await,
+            "rm" => self.cmd_rm(args).await,
+            "mv" => self.cmd_mv(args).await,
+            "df" => self.cmd_df().await,
             "sleep" => self.cmd_sleep().await,
             "log" => self.cmd_log(args).await,
             "scope" => self.cmd_scope(args).await,

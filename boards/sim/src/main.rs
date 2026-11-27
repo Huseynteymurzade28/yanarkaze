@@ -18,7 +18,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
 use heapless::String;
-use yanarkaze_core::{BoardInfo, Button, HwError, Led, MemRegion, PinInfo, Pull, Reading, Sensor, System, Watchdog};
+use yanarkaze_core::{
+    Area, BoardInfo, Button, HwError, Led, MemRegion, PinInfo, Pull, Reading, Sensor, System, Watchdog,
+};
 
 const RESET_REASON_ENV: &str = "YANARKAZE_RESET_REASON";
 const WATCHDOG_TIMEOUT_MS: u64 = 2000;
@@ -231,8 +233,8 @@ struct SimSystem {
     /// The last PWM output set (frequency, duty in 0.1 %), as if wired to every analog pin
     /// for `scope`.
     pwm: Option<(u32, u16)>,
-    /// The log file, read on first use.
-    log: Option<Vec<u8>>,
+    /// The flash area files (log, files), read on first use.
+    areas: [Option<Vec<u8>>; 2],
 }
 
 /// Pretend header: GP0-15 for gpio / pwm, GP26-28 analog.
@@ -262,22 +264,29 @@ fn sim_settings_path() -> std::path::PathBuf {
     }
 }
 
-/// The temperature log's "flash": a file of `SIM_LOG_PAGES` pages, erased to 0xFF.
-const SIM_LOG_PAGES: usize = 16;
-const SIM_LOG_PAGE: usize = 2048;
+/// The flash areas, each a file of 2 KB pages, erased to 0xFF: the temperature log
+/// (16 pages, `$YANARKAZE_LOG` or `~/.yanarkaze-log`) and the files (48 pages,
+/// `$YANARKAZE_FILES` or `~/.yanarkaze-files`).
+const SIM_PAGE: usize = 2048;
 
-fn sim_log_path() -> std::path::PathBuf {
-    match env::var_os("YANARKAZE_LOG") {
+fn sim_area(area: Area) -> (usize, std::path::PathBuf) {
+    let (pages, var, name) = match area {
+        Area::Log => (16, "YANARKAZE_LOG", ".yanarkaze-log"),
+        Area::Files => (48, "YANARKAZE_FILES", ".yanarkaze-files"),
+    };
+    let path = match env::var_os(var) {
         Some(path) => path.into(),
-        None => env::home_dir().unwrap_or_default().join(".yanarkaze-log"),
-    }
+        None => env::home_dir().unwrap_or_default().join(name),
+    };
+    (pages, path)
 }
 
-/// The log file's bytes, created erased if it is missing or the wrong size.
-fn sim_log_bytes() -> Vec<u8> {
-    match std::fs::read(sim_log_path()) {
-        Ok(b) if b.len() == SIM_LOG_PAGES * SIM_LOG_PAGE => b,
-        _ => vec![0xFF; SIM_LOG_PAGES * SIM_LOG_PAGE],
+/// An area's bytes, created erased if the file is missing or the wrong size.
+fn sim_area_bytes(area: Area) -> Vec<u8> {
+    let (pages, path) = sim_area(area);
+    match std::fs::read(path) {
+        Ok(b) if b.len() == pages * SIM_PAGE => b,
+        _ => vec![0xFF; pages * SIM_PAGE],
     }
 }
 
@@ -345,8 +354,15 @@ impl SimSystem {
             levels: 0,
             i2c_cmd: std::array::from_fn(|_| Vec::new()),
             pwm: None,
-            log: None,
+            areas: [None, None],
         }
+    }
+}
+
+impl SimSystem {
+    fn area_bytes(&mut self, area: Area) -> &mut Vec<u8> {
+        let i = area as usize;
+        self.areas[i].get_or_insert_with(|| sim_area_bytes(area))
     }
 }
 
@@ -468,30 +484,30 @@ impl System for SimSystem {
         result.map_err(|_| HwError::Bus)
     }
 
-    fn log_geometry(&self) -> Option<(usize, usize)> {
-        Some((SIM_LOG_PAGES, SIM_LOG_PAGE))
+    fn flash_area(&self, area: Area) -> Option<(usize, usize)> {
+        Some((sim_area(area).0, SIM_PAGE))
     }
 
-    fn log_read(&mut self, offset: usize, buf: &mut [u8; 8]) -> Result<(), HwError> {
-        let bytes = self.log.get_or_insert_with(sim_log_bytes);
-        buf.copy_from_slice(bytes.get(offset..offset + 8).ok_or(HwError::OutOfRange)?);
+    fn area_read(&mut self, area: Area, offset: usize, buf: &mut [u8]) -> Result<(), HwError> {
+        let bytes = self.area_bytes(area);
+        buf.copy_from_slice(bytes.get(offset..offset + buf.len()).ok_or(HwError::OutOfRange)?);
         Ok(())
     }
 
     /// Like flash, a write can only clear bits; the file is rewritten each time.
-    fn log_write(&mut self, offset: usize, record: &[u8; 8]) -> Result<(), HwError> {
-        let bytes = self.log.get_or_insert_with(sim_log_bytes);
-        let word = bytes.get_mut(offset..offset + 8).ok_or(HwError::OutOfRange)?;
-        for (w, r) in word.iter_mut().zip(record) {
-            *w &= r;
+    fn area_write(&mut self, area: Area, offset: usize, data: &[u8]) -> Result<(), HwError> {
+        let bytes = self.area_bytes(area);
+        let target = bytes.get_mut(offset..offset + data.len()).ok_or(HwError::OutOfRange)?;
+        for (b, d) in target.iter_mut().zip(data) {
+            *b &= d;
         }
-        std::fs::write(sim_log_path(), &*bytes).map_err(|_| HwError::Bus)
+        std::fs::write(sim_area(area).1, &*self.area_bytes(area)).map_err(|_| HwError::Bus)
     }
 
-    fn log_erase(&mut self, page: usize) -> Result<(), HwError> {
-        let bytes = self.log.get_or_insert_with(sim_log_bytes);
-        bytes.get_mut(page * SIM_LOG_PAGE..(page + 1) * SIM_LOG_PAGE).ok_or(HwError::OutOfRange)?.fill(0xFF);
-        std::fs::write(sim_log_path(), &*bytes).map_err(|_| HwError::Bus)
+    fn area_erase(&mut self, area: Area, page: usize) -> Result<(), HwError> {
+        let bytes = self.area_bytes(area);
+        bytes.get_mut(page * SIM_PAGE..(page + 1) * SIM_PAGE).ok_or(HwError::OutOfRange)?.fill(0xFF);
+        std::fs::write(sim_area(area).1, &*self.area_bytes(area)).map_err(|_| HwError::Bus)
     }
 
     async fn i2c_write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), HwError> {

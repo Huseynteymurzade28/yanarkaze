@@ -118,6 +118,15 @@ pub struct BoardInfo {
     pub hints: &'static [&'static str],
 }
 
+/// A region of flash a board lends to the core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Area {
+    /// The temperature log.
+    Log,
+    /// The file system.
+    Files,
+}
+
 /// What ended a [`System::deep_sleep`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
@@ -232,24 +241,25 @@ pub trait System {
         Ok((elapsed_ns / buf.len().max(1) as u64).min(u32::MAX as u64) as u32)
     }
 
-    /// Flash set aside for the temperature log: (pages, bytes per page). `None` (the default)
-    /// means the board has no room for one. See [`crate::log`].
-    fn log_geometry(&self) -> Option<(usize, usize)> {
+    /// Flash set aside for `area`: (pages, bytes per page). `None` (the default) means the
+    /// board has none. The log ([`crate::log`]) and the files ([`crate::ember`]) each get one.
+    fn flash_area(&self, _area: Area) -> Option<(usize, usize)> {
         None
     }
 
-    /// Reads 8 bytes at `offset` in the log area.
-    fn log_read(&mut self, _offset: usize, _buf: &mut [u8; 8]) -> Result<(), HwError> {
+    /// Reads `buf.len()` bytes at `offset` in `area`.
+    fn area_read(&mut self, _area: Area, _offset: usize, _buf: &mut [u8]) -> Result<(), HwError> {
         Err(HwError::Unsupported)
     }
 
-    /// Writes 8 bytes at `offset` (8-aligned, erased since the last write).
-    fn log_write(&mut self, _offset: usize, _record: &[u8; 8]) -> Result<(), HwError> {
+    /// Writes `data` at `offset` in `area`. Both are multiples of 8, and the bytes have been
+    /// erased since they were last written.
+    fn area_write(&mut self, _area: Area, _offset: usize, _data: &[u8]) -> Result<(), HwError> {
         Err(HwError::Unsupported)
     }
 
-    /// Erases page `page` of the log area to 0xFF.
-    fn log_erase(&mut self, _page: usize) -> Result<(), HwError> {
+    /// Erases page `page` of `area` to 0xFF.
+    fn area_erase(&mut self, _area: Area, _page: usize) -> Result<(), HwError> {
         Err(HwError::Unsupported)
     }
 

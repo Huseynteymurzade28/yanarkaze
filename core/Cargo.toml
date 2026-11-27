@@ -13,6 +13,8 @@ embassy-time = "0.5"
 embedded-io-async = "0.7"
 heapless = "0.9"
 portable-atomic = "1"
+sequential-storage = "8"
+embedded-storage-async = "0.4"
 
 [features]
 default = ["atomics-via-critical-section"]

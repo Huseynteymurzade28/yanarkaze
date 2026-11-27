@@ -123,6 +123,13 @@ Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
                        | clear | invert | contrast <0-255> | on | off
 
+Files (ember, in flash: NUCLEO and the simulator):
+  ls                   list the files
+  cat <file>...        print files
+  rm <file>...         delete files
+  mv <file> <name>     rename a file
+  df                   how much room the files take
+
 Fun:
   reaction             reflex game: hit the button when the LED turns on
   roll [N]dM           roll dice with the RNG (roll 2d6, roll d20)
@@ -181,6 +188,13 @@ UART is asleep when it arrives. Other boards wait in the executor's normal idle 
 
 For `scope`, wire a PWM output to an analog pin: `pwm D3 25 1000; scope A0 20` shows a
 1 kHz square wave at 25 % duty (in the simulator, PWM output reaches every analog pin).
+
+Any command's output can go into a file: `echo hello > notes.txt` writes one, `temp >>
+notes.txt` adds to it. Files live in ember, a small flat file system in flash (96 KB on the
+NUCLEO, 32 files of up to 8 KB) on top of
+[sequential-storage](https://github.com/tweedegolf/sequential-storage), which spreads the
+wear and survives a reset in the middle of a write. Names start with a letter, so `calc 256
+>> 2` is still a shift.
 
 The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
 are stored on the NUCLEO (last flash page) and in the simulator (`~/.yanarkaze-settings`, or

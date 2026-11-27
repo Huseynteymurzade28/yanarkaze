@@ -6,7 +6,7 @@
 //! newest one (the highest number) tells where to carry on. Nothing else has to be kept.
 
 use crate::env::crc8;
-use crate::platform::{HwError, System};
+use crate::platform::{Area, HwError, System};
 
 /// Bytes per record: one 64-bit flash word on the STM32L4, the smallest it can write.
 pub const RECORD: usize = 8;
@@ -65,16 +65,16 @@ pub struct SysFlash<'a, S: System>(pub &'a mut S);
 
 impl<S: System> LogFlash for SysFlash<'_, S> {
     fn geometry(&self) -> Option<(usize, usize)> {
-        self.0.log_geometry()
+        self.0.flash_area(Area::Log)
     }
     fn read(&mut self, offset: usize, buf: &mut [u8; RECORD]) -> Result<(), HwError> {
-        self.0.log_read(offset, buf)
+        self.0.area_read(Area::Log, offset, buf)
     }
     fn write(&mut self, offset: usize, record: &[u8; RECORD]) -> Result<(), HwError> {
-        self.0.log_write(offset, record)
+        self.0.area_write(Area::Log, offset, record)
     }
     fn erase(&mut self, page: usize) -> Result<(), HwError> {
-        self.0.log_erase(page)
+        self.0.area_erase(Area::Log, page)
     }
 }
 

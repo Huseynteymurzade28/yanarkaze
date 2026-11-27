@@ -14,7 +14,9 @@
 mod term;
 mod calc;
 mod editor;
+pub mod ember;
 pub mod env;
+mod files;
 mod fun;
 mod game2048;
 mod hw;
@@ -36,7 +38,8 @@ pub mod shell;
 pub mod watchdog;
 
 pub use platform::{
-    BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull, Reading, Sensor, Slept, System, Wake, Watchdog,
+    Area, BoardInfo, Button, HwError, Led, MemRegion, PinInfo, PinStyle, Pull, Reading, Sensor, Slept, System, Wake,
+    Watchdog,
 };
 
 /// Version of the core, shown by `info`.
