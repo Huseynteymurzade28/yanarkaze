@@ -5,7 +5,7 @@ use embassy_time::{Instant, Timer};
 use portable_atomic::Ordering;
 
 use crate::platform::Button;
-use crate::state::{BUTTON_PRESSES, BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, LedMode, STAT_BUTTON, set_led_mode};
+use crate::state::{BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, Event, GAME_ACTIVE, LedMode, STAT_BUTTON, set_led_mode};
 
 const DEBOUNCE_MS: u64 = 20;
 /// A press only counts once the pin has stayed down this long, so short contacts are
@@ -30,6 +30,8 @@ pub async fn run(mut button: impl Button) -> ! {
 
         if GAME_ACTIVE.load(Ordering::Relaxed) {
             BUTTON_SIGNAL.signal(pressed_at);
+            button.wait_for_release().await;
+            BUTTON_RELEASE.signal(Instant::now());
         } else {
             let presses = BUTTON_PRESSES.fetch_add(1, Ordering::Relaxed) + 1;
             let mode = cycle[index].clone();

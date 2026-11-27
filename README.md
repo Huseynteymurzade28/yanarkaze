@@ -101,6 +101,8 @@ System:
   autorun [cmd|off]    a command line to run at boot
   save                 keep the aliases and the autorun across reboots (in flash)
   forget               erase the saved settings
+  menu                 use the board without a computer: OLED menu, tap the button = next,
+                       hold = run, press again = back (arrows, Enter and q work too)
   hang                 freeze the executor -> watchdog resets the system
   reboot               restart
   bootloader           restart into the USB bootloader, ready for new firmware (RP boards)
@@ -115,6 +117,7 @@ Hardware (Pico 2, NUCLEO-L452RE and the simulator):
   knob <adc> <pwm>     a potentiometer dims an LED, live: knob 26 16 (NUCLEO: knob A0 D3)
   i2c scan|read|write  find I2C devices (and name the common ones), read or write registers
   env [watch]          room temperature, humidity, pressure: BME280/BMP280, SHT3x, AHT20
+  plot <what> [ms]     live chart on the OLED: temp | env | rh | hpa | <adc pin>  (plot A0 50)
   oled <action>        SSD1306 OLED at 0x3C: text <msg> | temp | dash | life | logo | preview
                        | clear | invert | contrast <0-255> | on | off
 
@@ -158,6 +161,11 @@ yanarkaze> autorun led heartbeat; oled dash
 yanarkaze> save                        -> kept in flash, loaded and run at the next boot
 ```
 
+With an OLED and `autorun menu; save`, the board works on its own from a USB charger: the
+menu offers `top`, `mandel`, charts of the chip temperature and the first analog pin, the
+room sensor if one is attached, `life`, the dashboard and the logo. A tap on the button
+stops what is running and brings the menu back.
+
 The autorun is skipped after a watchdog reset, in case it is what hung the board. Settings
 are stored on the NUCLEO (last flash page) and in the simulator (`~/.yanarkaze-settings`, or
 `$YANARKAZE_SETTINGS`); other boards keep them until reboot.
@@ -200,8 +208,10 @@ D14 is PB9 on the NUCLEO-L452RE but PB7 on the NUCLEO-L452RE-P; the firmware fin
 boot from the module's pull-ups, so attach the display before powering up.
 
 Then `i2c scan` should find the display at 0x3C, the logo appears at the next boot, and
-`oled dash`, `snake`, `2048`, `top`, `mandel` and `knob` draw on it. I2C is blocking on this
-board, so a full OLED frame pauses the other tasks for about 25 ms.
+`oled dash`, `snake`, `2048`, `top`, `mandel`, `knob`, `plot` and `menu` draw on it.
+The blue USER button (PC13) drives `menu`. I2C is blocking on this
+board, so a full OLED frame pauses the other tasks for about 25 ms (DMA I2C was tried and
+runs into two bugs in embassy-stm32 0.6, see `boards/nucleo-l452re/src/main.rs`).
 
 The hardware commands use the Arduino pins that are wired the same on the NUCLEO-L452RE and
 the -P (many others differ between the two). Type them by Arduino name or MCU name:

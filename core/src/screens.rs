@@ -181,6 +181,159 @@ pub fn env(d: &mut Display, title: &str, reading: &crate::env::EnvReading) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// plot
+// ---------------------------------------------------------------------------
+
+/// The last `WIDTH` samples of something, one per screen column, for [`plot`].
+pub struct Series {
+    values: [f32; WIDTH],
+    /// Index the next value goes to.
+    next: usize,
+    len: usize,
+}
+
+impl Series {
+    pub const fn new() -> Self {
+        Self { values: [0.0; WIDTH], next: 0, len: 0 }
+    }
+
+    pub fn push(&mut self, value: f32) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % WIDTH;
+        self.len = (self.len + 1).min(WIDTH);
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The stored values, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = f32> + '_ {
+        let start = (self.next + WIDTH - self.len) % WIDTH;
+        (0..self.len).map(move |i| self.values[(start + i) % WIDTH])
+    }
+
+    pub fn last(&self) -> Option<f32> {
+        (self.len > 0).then(|| self.values[(self.next + WIDTH - 1) % WIDTH])
+    }
+
+    /// Smallest and largest stored value.
+    pub fn min_max(&self) -> Option<(f32, f32)> {
+        self.iter().fold(None, |acc, v| match acc {
+            None => Some((v, v)),
+            Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+        })
+    }
+}
+
+impl Default for Series {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How [`plot`] maps values to rows.
+#[derive(Clone, Copy)]
+pub enum Scale {
+    /// Always this range (a potentiometer's 0..3300 mV).
+    Fixed(f32, f32),
+    /// Fit the data, but never zoom in closer than this span, so sensor noise stays flat.
+    Auto { min_span: f32 },
+}
+
+/// Top and bottom rows of the chart area.
+const PLOT_TOP: i32 = 12;
+const PLOT_BOTTOM: i32 = 54;
+
+/// The range `series` is drawn with.
+pub fn plot_range(series: &Series, scale: Scale) -> (f32, f32) {
+    match scale {
+        Scale::Fixed(lo, hi) => (lo, hi),
+        Scale::Auto { min_span } => {
+            let (lo, hi) = series.min_max().unwrap_or((0.0, 0.0));
+            if hi - lo >= min_span {
+                (lo, hi)
+            } else {
+                let mid = (lo + hi) / 2.0;
+                (mid - min_span / 2.0, mid + min_span / 2.0)
+            }
+        }
+    }
+}
+
+/// The row a value is drawn at.
+fn plot_row(value: f32, (lo, hi): (f32, f32)) -> i32 {
+    let fraction = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+    PLOT_BOTTOM - (fraction * (PLOT_BOTTOM - PLOT_TOP) as f32 + 0.5) as i32
+}
+
+/// A scrolling line chart: `title` and the latest value in the header, the newest sample at
+/// the right edge, and the lowest and highest value on screen along the bottom. Values are
+/// printed with `decimals` digits after the point and `unit` after them.
+pub fn plot(d: &mut Display, title: &str, series: &Series, scale: Scale, decimals: usize, unit: &str) {
+    d.clear();
+    let mut line: String<24> = String::new();
+    d.text(2, 1, title, 1);
+    if let Some(v) = series.last() {
+        let _ = write!(line, "{v:.decimals$}{unit}");
+        text_right(d, WIDTH as i32 - 2, 1, &line);
+    }
+    d.invert_rect(0, 0, WIDTH as i32, 10);
+    // Dotted lines along the top and bottom of the chart.
+    for x in (0..WIDTH as i32).step_by(4) {
+        d.set(x, PLOT_TOP, true);
+        d.set(x, PLOT_BOTTOM, true);
+    }
+    let range = plot_range(series, scale);
+    let x0 = (WIDTH - series.len()) as i32;
+    let mut prev: Option<(i32, i32)> = None;
+    for (i, v) in series.iter().enumerate() {
+        let (x, y) = (x0 + i as i32, plot_row(v, range));
+        match prev {
+            Some((px, py)) => d.line(px, py, x, y),
+            None => d.set(x, y, true),
+        }
+        prev = Some((x, y));
+    }
+    if let Some((lo, hi)) = series.min_max() {
+        line.clear();
+        let _ = write!(line, "lo {lo:.decimals$}");
+        d.text(0, HEIGHT as i32 - 7, &line, 1);
+        line.clear();
+        let _ = write!(line, "hi {hi:.decimals$}");
+        text_right(d, WIDTH as i32, HEIGHT as i32 - 7, &line);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// menu
+// ---------------------------------------------------------------------------
+
+/// Rows of items that fit under the header.
+pub const MENU_ROWS: usize = 5;
+
+/// A list with the `selected` item in inverse video, scrolled so that it is on screen.
+pub fn menu(d: &mut Display, title: &str, items: &[&str], selected: usize) {
+    d.clear();
+    header(d, title);
+    let first = selected.saturating_sub(MENU_ROWS - 1);
+    for (row, (i, item)) in items.iter().enumerate().skip(first).take(MENU_ROWS).enumerate() {
+        let y = 13 + row as i32 * 10;
+        d.text(4, y, item, 1);
+        if i == selected {
+            d.invert_rect(0, y - 1, WIDTH as i32, 9);
+        }
+    }
+    // A scroll bar when not everything fits.
+    if items.len() > MENU_ROWS {
+        let track = (HEIGHT - 12) as i32;
+        let h = (track * MENU_ROWS as i32 / items.len() as i32).max(3);
+        let y = 12 + (track - h) * first as i32 / (items.len() - MENU_ROWS) as i32;
+        d.fill_rect(WIDTH as i32 - 2, y, 2, h, true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -249,6 +402,48 @@ mod tests {
     }
 
     #[test]
+    fn series_keeps_the_newest_in_order() {
+        let mut s = Series::new();
+        assert!(s.last().is_none() && s.min_max().is_none());
+        for i in 0..WIDTH + 3 {
+            s.push(i as f32);
+        }
+        assert_eq!(s.len(), WIDTH);
+        assert_eq!(s.iter().next(), Some(3.0));
+        assert_eq!(s.last(), Some((WIDTH + 2) as f32));
+        assert_eq!(s.min_max(), Some((3.0, (WIDTH + 2) as f32)));
+    }
+
+    #[test]
+    fn plot_scales_and_scrolls() {
+        let mut s = Series::new();
+        s.push(0.0);
+        s.push(100.0);
+        let mut d = Display::new();
+        plot(&mut d, "x", &s, Scale::Fixed(0.0, 100.0), 0, "");
+        // Newest sample at the right edge, at the top; the one before at the bottom.
+        assert!(d.pixel(WIDTH - 1, PLOT_TOP as usize));
+        assert!(d.pixel(WIDTH - 2, PLOT_BOTTOM as usize));
+        // A flat signal sits in the middle when autoscaled, not along an edge.
+        let mut flat = Series::new();
+        flat.push(21.5);
+        assert_eq!(plot_range(&flat, Scale::Auto { min_span: 2.0 }), (20.5, 22.5));
+        assert_eq!(plot_row(21.5, (20.5, 22.5)), (PLOT_TOP + PLOT_BOTTOM) / 2);
+    }
+
+    #[test]
+    fn menu_scrolls_to_the_selection() {
+        let items = ["a", "b", "c", "d", "e", "f", "g"];
+        let mut d = Display::new();
+        menu(&mut d, "menu", &items, 0);
+        assert!(d.pixel(0, 12)); // first row highlighted
+        let mut d = Display::new();
+        menu(&mut d, "menu", &items, 6);
+        // The last item is now the bottom row, highlighted.
+        assert!(d.pixel(0, 12 + 4 * 10) && !d.pixel(0, 12));
+    }
+
+    #[test]
     #[ignore = "prints the screens; run with --ignored --nocapture"]
     fn preview() {
         let mut d = Display::new();
@@ -270,6 +465,16 @@ mod tests {
         let mut d = Display::new();
         let r = crate::env::EnvReading { temp_c: 22.43, humidity: Some(45.2), pressure_hpa: Some(1013.25) };
         env(&mut d, "BME280 at 0x76", &r);
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        let mut s = Series::new();
+        for i in 0..90 {
+            s.push(22.0 + (i as f32 / 9.0).sin() * 0.8 + i as f32 * 0.01);
+        }
+        plot(&mut d, "temp", &s, Scale::Auto { min_span: 2.0 }, 1, " C");
+        std::println!("{}", ascii(&d));
+        let mut d = Display::new();
+        menu(&mut d, "tap: next  hold: ok", &["top", "mandel", "plot temp", "plot A0", "life", "dash", "exit"], 5);
         std::println!("{}", ascii(&d));
     }
 }

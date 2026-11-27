@@ -3,7 +3,7 @@
 use core::fmt::Write as _;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_time::{Instant, Timer};
 use embedded_io_async::{Read, Write};
 use heapless::String;
@@ -13,7 +13,7 @@ use crate::editor::{Editor, Out};
 use crate::oled::Display;
 use crate::platform::System;
 use crate::state::{
-    ALERT_MILLI_C, BUTTON_PRESSES, EVENTS, Event, HISTORY_SECS, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS,
+    ALERT_MILLI_C, BUTTON_PRESSES, BUTTON_RELEASE, BUTTON_SIGNAL, EVENTS, GAME_ACTIVE, Event, HISTORY_SECS, LedMode, MORSE_MAX, SAMPLE, STAT_SHELL, STATS,
     TEMP_HISTORY, alert_limit_c, current_led_mode, set_led_mode,
 };
 use crate::term::Term;
@@ -71,6 +71,7 @@ pub(crate) const SYSTEM_COMMANDS: &[Command] = &[
     Command { completions: &["off"], ..cmd("autorun", "[cmd|off]", "a command line to run at boot") },
     cmd("save", "", "keep the aliases and the autorun across reboots (in flash)"),
     cmd("forget", "", "erase the saved settings"),
+    cmd("menu", "", "use the board without a computer: OLED menu, tap the button = next, hold = run"),
     cmd("hang", "", "freeze the executor -> watchdog resets the system"),
     cmd("reboot", "", "restart"),
     cmd("bootloader", "", "restart into the USB bootloader, ready for new firmware"),
@@ -95,6 +96,10 @@ pub(crate) const HW_COMMANDS: &[Command] = &[
     Command {
         completions: &["watch"],
         ..cmd("env", "[watch]", "room temperature, humidity, pressure (BME280, SHT3x, AHT20)")
+    },
+    Command {
+        completions: &["temp", "env", "rh", "hpa"],
+        ..cmd("plot", "<what> [ms]", "live chart on the OLED: temp | env | rh | hpa | <adc pin>")
     },
     Command {
         completions: OLED_ACTIONS,
@@ -261,6 +266,10 @@ pub struct Shell<S: System, R: Read, W: Write> {
     pub(crate) oled_ready: bool,
     pub(crate) oled_inverted: bool,
     pub(crate) settings: Settings,
+    /// While the button menu runs, a button press also stops a running command, the way a
+    /// key does. `menu_stopped` records that a command was stopped (rather than finishing).
+    pub(crate) in_menu: bool,
+    pub(crate) menu_stopped: bool,
 }
 
 /// The shell task body. Run it from a board's `#[embassy_executor::task]`.
@@ -279,6 +288,8 @@ pub async fn run<S: System, R: Read, W: Write>(sys: S, rx: R, tx: W, spawner: Sp
         oled_ready: false,
         oled_inverted: false,
         settings: Settings::default(),
+        in_menu: false,
+        menu_stopped: false,
     };
     shell.main_loop().await
 }
@@ -292,6 +303,24 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     /// Waits `ms` milliseconds. Returns true if a key was pressed in the meantime.
     pub(crate) async fn key_or_timeout(&mut self, ms: u64) -> bool {
         let mut buf = [0u8; 8];
+        if self.in_menu {
+            let waited = select3(self.rx.read(&mut buf), Timer::after_millis(ms), BUTTON_SIGNAL.wait()).await;
+            return match waited {
+                Either3::First(Ok(n)) if n > 0 => {
+                    self.menu_stopped = true;
+                    true
+                }
+                Either3::First(_) => {
+                    Timer::after_millis(ms).await;
+                    false
+                }
+                Either3::Second(()) => false,
+                Either3::Third(_) => {
+                    self.menu_stopped = true;
+                    true
+                }
+            };
+        }
         match select(self.rx.read(&mut buf), Timer::after_millis(ms)).await {
             Either::First(Ok(n)) if n > 0 => true,
             Either::First(_) => {
@@ -445,8 +474,145 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
                     },
                     _ => self.term.print("usage: every <0.1..3600 seconds> <command>\r\n").await,
                 },
+                "menu" => self.cmd_menu().await,
                 _ => self.run_single(part).await,
             }
+        }
+    }
+
+    /// A menu for using the board without a computer: on the OLED (and the terminal), driven
+    /// by the button. A tap moves to the next item, holding the button runs it, and a press
+    /// stops what is running. The terminal works too: arrows or j/k, Enter, q to leave.
+    async fn cmd_menu(&mut self) {
+        const HOLD_MS: u64 = 500;
+        const TITLE: &str = "tap: next  hold: run";
+        type Label = heapless::String<16>;
+        type Line = heapless::String<24>;
+        let mut items: heapless::Vec<(Label, Line), 12> = heapless::Vec::new();
+        let mut add = |label: &str, cmd: &str| {
+            let _ = items.push((label.try_into().unwrap_or_default(), cmd.try_into().unwrap_or_default()));
+        };
+        add("top", "top");
+        add("mandel", "mandel");
+        add("plot chip temp", "plot temp");
+        // The first analog pin, for a potentiometer.
+        if let Some(pin) = self.sys.pins().iter().find(|p| p.adc).map(|p| p.pin) {
+            let name = crate::hw::pin_name(self.sys.pin_style(), pin);
+            let mut label = Label::new();
+            let mut cmd = Line::new();
+            let _ = write!(label, "plot {}", name.as_str());
+            let _ = write!(cmd, "plot {}", name.as_str());
+            add(&label, &cmd);
+        }
+        if !crate::env::detect(&mut self.sys).await.is_empty() {
+            add("room sensor", "env watch");
+            add("plot room temp", "plot env");
+        }
+        add("life", "oled life");
+        add("dashboard", "oled dash");
+        add("logo", "oled logo");
+        add("exit", "");
+
+        let mut on_oled = self.oled_init().await.is_ok();
+        self.term
+            .print("menu: tap the button for the next item, hold it to run; or arrows, Enter, q\r\n")
+            .await;
+        if !on_oled {
+            self.term.print("(no OLED: the menu is only here in the terminal)\r\n").await;
+        }
+        GAME_ACTIVE.store(true, Ordering::Relaxed);
+        self.in_menu = true;
+        let mut keys = crate::keys::KeyDecoder::new();
+        let mut selected = 0;
+        loop {
+            // Show the menu.
+            let labels: heapless::Vec<&str, 12> = items.iter().map(|(l, _)| l.as_str()).collect();
+            out!(self.term, "\r> {}  ({}/{})\x1b[K", labels[selected], selected + 1, labels.len());
+            self.term.flush().await;
+            if on_oled {
+                screens::menu(&mut self.oled, TITLE, &labels, selected);
+                self.oled_mirror(&mut on_oled).await;
+            }
+
+            // Wait for a choice.
+            enum Choice {
+                Next,
+                Run,
+                Leave,
+            }
+            let mut buf = [0u8; 8];
+            let choice = match select(BUTTON_SIGNAL.wait(), self.rx.read(&mut buf)).await {
+                Either::First(pressed_at) => {
+                    // Released before HOLD_MS is a tap. A release from before this press
+                    // (one that stopped a command) is stale and does not count.
+                    let deadline = pressed_at + embassy_time::Duration::from_millis(HOLD_MS);
+                    loop {
+                        match select(BUTTON_RELEASE.wait(), Timer::at(deadline)).await {
+                            Either::First(released) if released >= pressed_at => break Choice::Next,
+                            Either::First(_) => continue,
+                            Either::Second(()) => break Choice::Run,
+                        }
+                    }
+                }
+                Either::Second(Ok(n)) => {
+                    // Moves take effect one by one (several keys can come in one read);
+                    // Enter or q ends the batch.
+                    use crate::keys::Key;
+                    let mut choice = None;
+                    for &b in &buf[..n] {
+                        match keys.feed(b) {
+                            Some(Key::Down | Key::Char(b'j' | b' ')) => selected = (selected + 1) % items.len(),
+                            Some(Key::Up | Key::Char(b'k')) => selected = (selected + items.len() - 1) % items.len(),
+                            Some(Key::Enter) => choice = Some(Choice::Run),
+                            Some(Key::Interrupt | Key::Char(b'q')) => choice = Some(Choice::Leave),
+                            _ => {}
+                        }
+                        if choice.is_some() {
+                            break;
+                        }
+                    }
+                    match choice {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                }
+                Either::Second(Err(_)) => {
+                    Timer::after_millis(100).await;
+                    continue;
+                }
+            };
+            match choice {
+                Choice::Next => selected = (selected + 1) % items.len(),
+                Choice::Leave => break,
+                Choice::Run => {
+                    let cmd = items[selected].1.clone();
+                    if cmd.is_empty() {
+                        break;
+                    }
+                    out!(self.term, "\r\n{PROMPT}{} \x1b[2m(menu)\x1b[0m\r\n", cmd.as_str());
+                    BUTTON_SIGNAL.reset();
+                    self.menu_stopped = false;
+                    self.run_single(&cmd).await;
+                    GAME_ACTIVE.store(true, Ordering::Relaxed); // in case the command handed it back
+                    on_oled = self.oled_ready;
+                    // A command that ends by itself (mandel, logo) leaves its picture up
+                    // until the next press.
+                    if !self.menu_stopped {
+                        self.term.print("\x1b[2m(press the button or a key for the menu)\x1b[0m").await;
+                        self.term.flush().await;
+                        let mut buf = [0u8; 8];
+                        let _ = select(BUTTON_SIGNAL.wait(), self.rx.read(&mut buf)).await;
+                    }
+                    self.term.print("\r\n").await;
+                }
+            }
+        }
+        self.in_menu = false;
+        GAME_ACTIVE.store(false, Ordering::Relaxed);
+        self.term.print("\r\nmenu closed\r\n").await;
+        if on_oled {
+            self.oled.clear();
+            self.oled_mirror(&mut on_oled).await;
         }
     }
 
@@ -560,6 +726,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "knob" => self.cmd_knob(args).await,
             "i2c" => self.cmd_i2c(args).await,
             "env" => self.cmd_env(args).await,
+            "plot" => self.cmd_plot(args).await,
             "alias" => self.cmd_alias(rest).await,
             "unalias" => match args.next() {
                 Some(name) if self.settings.remove_alias(name) => out!(self.term, "removed '{name}'{UNSAVED}\r\n"),
@@ -576,6 +743,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
             "calc" => self.cmd_calc(rest).await,
             // Reached only for misuse like `repeat 2 repeat 3 x`; run_command handles the rest.
             "repeat" | "every" => self.term.print("repeat and every cannot be nested\r\n").await,
+            "menu" => self.term.print("the menu runs commands itself, so it cannot run inside one\r\n").await,
             "alert" => match args.next().and_then(|v| v.parse::<f32>().ok()) {
                 Some(c) => {
                     ALERT_MILLI_C.store((c * 1000.0) as i32, Ordering::Relaxed);

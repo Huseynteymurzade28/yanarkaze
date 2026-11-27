@@ -103,6 +103,8 @@ pub static BUTTON_PRESSES: AtomicU32 = AtomicU32::new(0);
 /// timestamp) instead of cycling LED modes.
 pub static GAME_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static BUTTON_SIGNAL: Signal<CriticalSectionRawMutex, Instant> = Signal::new();
+/// When the button was let go again, while a game owns it (the menu tells taps from holds).
+pub static BUTTON_RELEASE: Signal<CriticalSectionRawMutex, Instant> = Signal::new();
 
 pub fn set_led_mode(mode: LedMode) {
     CURRENT_LED_MODE.lock(|m| *m.borrow_mut() = mode.clone());

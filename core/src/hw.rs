@@ -355,6 +355,144 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
         }
     }
 
+    pub(crate) async fn cmd_plot<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
+        use crate::env::{self, Found};
+        use crate::screens::{Scale, Series};
+        const USAGE: &str = "plot temp | env | rh | hpa | <adc pin> [ms]   e.g. plot temp, plot A0 50";
+
+        /// What to sample. `Env` picks one of a room sensor's readings.
+        #[derive(Clone, Copy)]
+        enum Source {
+            Chip,
+            Env(Found, Quantity),
+            Adc(u8),
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum Quantity {
+            Temp,
+            Humidity,
+            Pressure,
+        }
+
+        let Some(what) = args.next() else {
+            out!(self.term, "usage: {USAGE}\r\n");
+            return;
+        };
+        let mut title: String<12> = String::new();
+        let mut unit: String<4> = String::new(); // as the OLED writes it
+        let (source, scale, decimals, default_ms) = match what {
+            "temp" => {
+                let _ = title.push_str("chip temp");
+                let _ = write!(unit, "{}C", oled::DEGREE);
+                (Source::Chip, Scale::Auto { min_span: 2.0 }, 1, 1000)
+            }
+            "env" | "rh" | "hpa" => {
+                let Some(&sensor) = env::detect(&mut self.sys).await.first() else {
+                    self.term.print("no room sensor found ('env' lists the ones it knows)\r\n").await;
+                    return;
+                };
+                let _ = title.push_str(sensor.kind.name());
+                match what {
+                    "env" => {
+                        let _ = write!(unit, "{}C", oled::DEGREE);
+                        (Source::Env(sensor, Quantity::Temp), Scale::Auto { min_span: 1.0 }, 2, 1000)
+                    }
+                    "rh" => {
+                        let _ = unit.push_str("%");
+                        (Source::Env(sensor, Quantity::Humidity), Scale::Auto { min_span: 5.0 }, 1, 1000)
+                    }
+                    _ => {
+                        let _ = unit.push_str(" hPa");
+                        (Source::Env(sensor, Quantity::Pressure), Scale::Auto { min_span: 1.0 }, 1, 1000)
+                    }
+                }
+            }
+            pin => {
+                let (style, aliases) = (self.sys.pin_style(), self.sys.pin_aliases());
+                let Some(pin) = parse_pin(style, aliases, pin) else {
+                    out!(self.term, "usage: {USAGE}\r\n");
+                    return;
+                };
+                let _ = title.push_str(&self.pin_name(pin));
+                let _ = unit.push_str(" mV");
+                (Source::Adc(pin), Scale::Fixed(0.0, 3300.0), 0, 100)
+            }
+        };
+        let period = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default_ms).clamp(20, 60_000);
+        // The terminal gets the same unit without the OLED's degree glyph.
+        let term_unit: String<4> = unit.chars().map(|c| if c == oled::DEGREE { ' ' } else { c }).collect();
+
+        let mut on_oled = self.oled_init().await.is_ok();
+        out!(self.term, "{} every {period} ms, {} (any key stops)\r\n", title.as_str(), if on_oled {
+            "chart on the OLED"
+        } else {
+            "numbers only: the chart needs the OLED"
+        });
+        let mut series = Series::new();
+        let mut next = embassy_time::Instant::now();
+        loop {
+            let value = match source {
+                Source::Chip => Ok(SAMPLE.lock(|s| s.get()).reading.temp_c),
+                Source::Adc(pin) => self.sys.adc_read(pin).await.map(|mv| mv as f32).map_err(|e| {
+                    let mut msg: String<48> = String::new();
+                    let _ = write!(msg, "{e}");
+                    msg
+                }),
+                Source::Env(sensor, q) => match env::read(&mut self.sys, sensor).await {
+                    Ok(r) => match q {
+                        Quantity::Temp => Ok(r.temp_c),
+                        Quantity::Humidity => r.humidity.ok_or_else(|| {
+                            let mut msg: String<48> = String::new();
+                            let _ = write!(msg, "the {} has no humidity sensor", sensor.kind.name());
+                            msg
+                        }),
+                        Quantity::Pressure => r.pressure_hpa.ok_or_else(|| {
+                            let mut msg: String<48> = String::new();
+                            let _ = write!(msg, "the {} has no pressure sensor", sensor.kind.name());
+                            msg
+                        }),
+                    },
+                    Err(e) => {
+                        let mut msg: String<48> = String::new();
+                        let _ = write!(msg, "{e}");
+                        Err(msg)
+                    }
+                },
+            };
+            let value = match value {
+                Ok(v) => v,
+                Err(msg) => {
+                    out!(self.term, "\r\nerror: {}\r\n", msg.as_str());
+                    return;
+                }
+            };
+            series.push(value);
+            let (lo, hi) = series.min_max().unwrap_or((value, value));
+            out!(
+                self.term,
+                "\r{}: {value:.decimals$}{}   lo {lo:.decimals$}  hi {hi:.decimals$}\x1b[K",
+                title.as_str(),
+                term_unit.as_str()
+            );
+            self.term.flush().await;
+            if on_oled {
+                crate::screens::plot(&mut self.oled, &title, &series, scale, decimals, &unit);
+                self.oled_mirror(&mut on_oled).await;
+            }
+            // Keep the pace even though reading and drawing take time of their own.
+            next += embassy_time::Duration::from_millis(period);
+            let now = embassy_time::Instant::now();
+            let wait = if next > now { (next - now).as_millis() } else {
+                next = now;
+                1
+            };
+            if self.key_or_timeout(wait).await {
+                break;
+            }
+        }
+        self.term.print("\r\n").await;
+    }
+
     pub(crate) async fn cmd_i2c<'a>(&mut self, mut args: impl Iterator<Item = &'a str>) {
         const USAGE: &str = "i2c scan | read <addr> <reg> [n] | write <addr> <byte>... | speed <khz> | reset";
         match args.next() {
@@ -489,7 +627,7 @@ impl<S: System, R: Read, W: Write> Shell<S, R, W> {
     }
 
     /// Initialises the display the first time it is used.
-    async fn oled_init(&mut self) -> Result<(), HwError> {
+    pub(crate) async fn oled_init(&mut self) -> Result<(), HwError> {
         if !self.oled_ready {
             self.oled_cmds(&oled::INIT).await?;
             self.oled_ready = true;
